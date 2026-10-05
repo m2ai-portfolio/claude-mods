@@ -1,4 +1,5 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 tier('user')
@@ -60,7 +61,51 @@ function world(on: On, file: { size: number; text: string }, isForeground = fals
     }
     return { result: { message: 'stopped' } }
   })
-  return { clock, toasts, statuses, stops, gate, agent, opens }
+  // The wake: each $.prompt.submit the mod makes, and how the engine answers it.
+  const submits: string[] = []
+  const submit: { answer: 'enter' | 'drop' | 'throw' } = { answer: 'enter' }
+  on('prompt.submit', ($, e) => {
+    submits.push(e.text)
+    if (submit.answer === 'throw') {
+      throw new Error('submit exploded')
+    }
+    return submit.answer === 'drop' ? { drop: 'blocked by a test hook' } : { text: e.text }
+  })
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', ($, e) => ({ text: e.answer }))
+  return { clock, toasts, statuses, stops, gate, agent, opens, submits, submit }
+}
+
+// The pane's whole drawing as text, for checking what a row says.
+async function paneText($: Parameters<TestBody>[0]): Promise<string> {
+  const ui = await $.ui.mount({
+    plugin: 'artifact-watchdog',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'artifact-watchdog',
+    props: PANE_PROPS,
+  })
+  return JSON.stringify(await ui.findAll({}))
+}
+
+// /watchdog as typed at the prompt: the engine stamps origin and presentation.
+function watchdog($: Parameters<TestBody>[0], args: string) {
+  return $.command.run({
+    command: 'watchdog',
+    args,
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 100 },
+  })
+}
+
+// Dispatch, let the artifact grow once, then sit still past the stall window.
+async function dispatchAndStall($: Parameters<TestBody>[0], w: ReturnType<typeof world>, file: { size: number; text: string }) {
+  await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+  await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+  file.size = 60
+  file.text = '# Report\n'
+  await w.clock.advance(15_000)
+  await w.clock.advance(5 * 60_000 + 15_000)
 }
 
 describe('register', () => {
@@ -278,6 +323,168 @@ describe('register', () => {
       requestId: 'artifact-watchdog',
       props: PANE_PROPS,
     })
-    expect(JSON.stringify(await ui.findAll({}))).toContain('probe done (stalled earlier)')
+    expect(JSON.stringify(await ui.findAll({}))).toContain('probe done (stalled earlier) · woke Claude')
   })
+})
+
+describe('wake on stall', () => {
+  test('a stall with the main loop idle submits one wake naming the agent', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await dispatchAndStall($, w, file)
+
+    expect(w.submits.length).toBe(1)
+    expect(w.submits[0]).toContain('"probe" (agent-7)')
+    expect(w.submits[0]).toContain(ARTIFACT)
+    expect(w.submits[0]).toContain('TaskStop agent agent-7 and do the task inline')
+    expect(w.toasts.length).toBe(1)
+    expect(await paneText($)).toContain('woke Claude')
+  })
+
+  test('later ticks of the same stall do not wake again', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await dispatchAndStall($, w, file)
+    expect(w.submits.length).toBe(1)
+
+    await w.clock.advance(20 * 60_000)
+    expect(w.submits.length).toBe(1)
+  })
+
+  test('growth after a stall, then a second stall, wakes once more', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await dispatchAndStall($, w, file)
+    expect(w.submits.length).toBe(1)
+
+    file.size = 140
+    file.text = '# Report\n## Section 2\n'
+    await w.clock.advance(15_000)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 running')
+    expect(w.submits.length).toBe(1)
+
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(w.submits.length).toBe(2)
+  })
+
+  test('/watchdog wake off stops the wake but not the toast; wake on lets the next stall wake', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    const off = await watchdog($, 'wake off')
+    expect(off.text).toContain('wake on stall is off')
+    expect((await watchdog($, 'wake')).text).toContain('is off')
+    expect(await paneText($)).toContain('wake off')
+
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.toasts.length).toBe(1)
+    expect(w.submits).toEqual([])
+
+    // Switched back on, the stall that landed while off stays unwoken; a new one wakes.
+    await watchdog($, 'wake on')
+    await w.clock.advance(5 * 60_000)
+    expect(w.submits).toEqual([])
+    file.size = 60
+    file.text = '# Report\n'
+    await w.clock.advance(15_000)
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.submits.length).toBe(1)
+  })
+
+  test('/watchdog with other args answers usage and opens nothing', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    expect((await watchdog($, 'wake maybe')).text).toContain('Usage')
+    expect(w.opens).toEqual([])
+    expect((await watchdog($, '')).text).toContain('Wake on stall: on')
+  })
+
+  test('a watch that completed or ended never wakes', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tc', description: 'done', prompt: PROMPT })
+    file.size = 90
+    file.text = '# Report\nAGENT COMPLETE: done\n'
+    await w.clock.advance(15_000)
+    await w.clock.advance(10 * 60_000)
+    expect(w.submits).toEqual([])
+
+    // A second dispatch whose agent hands back without the marker: ended, not stalled.
+    w.agent.status = 'completed'
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'te', description: 'quiet', prompt: PROMPT })
+    await w.clock.advance(10 * 60_000)
+    expect(w.submits).toEqual([])
+    expect(w.toasts).toEqual([])
+  })
+
+  test('a stall mid-turn leaves the note and wakes when that turn ends with the agent still stuck', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.turn.start({ text: 'work', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.toasts.length).toBe(1)
+    expect(w.submits).toEqual([])
+    expect(await paneText($)).toContain('wake pending until the turn ends')
+
+    await $.turn.complete({ answer: 'waiting on probe', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-1' })
+    expect(w.submits.length).toBe(1)
+    await w.clock.advance(5 * 60_000)
+    expect(w.submits.length).toBe(1)
+  })
+
+  test('a stall mid-turn whose agent Claude stopped before the turn ended never wakes', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.turn.start({ text: 'work', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+
+    w.agent.status = 'killed'
+    await $.turn.complete({ answer: 'stopped it', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-1' })
+    await w.clock.advance(5 * 60_000)
+    expect(w.submits).toEqual([])
+  })
+
+  test("a subagent's turn ending does not count as the main loop going idle", async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.turn.start({ text: 'work', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+
+    await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'sub-1', agentId: 'agent-9' })
+    await w.clock.advance(60_000)
+    expect(w.submits).toEqual([])
+  })
+
+  // drop: a hook refuses the prompt. throw: the engine skips a hook that throws
+  // and nothing beneath answers, so the mod's $.prompt.submit rejects.
+  for (const answer of ['drop', 'throw'] as const) {
+    test(`a wake the engine refuses (${answer}) is recorded on the row and nothing throws`, async ($, on) => {
+      const file = { size: 0, text: '' }
+      const w = world(on, file)
+      w.submit.answer = answer
+      await dispatchAndStall($, w, file)
+
+      expect(w.submits.length).toBe(1)
+      expect(w.toasts.length).toBe(1)
+      expect(w.opens).toEqual(['artifact-watchdog'])
+      expect(await paneText($)).toContain(
+        answer === 'drop' ? 'wake failed: blocked by a test hook' : 'wake failed: no implementation for prompt.submit',
+      )
+
+      // The watch keeps working: later ticks neither retry nor fail.
+      await w.clock.advance(10 * 60_000)
+      expect(w.submits.length).toBe(1)
+      expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    })
+  }
 })

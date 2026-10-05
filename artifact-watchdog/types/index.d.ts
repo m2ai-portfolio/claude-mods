@@ -25,10 +25,23 @@ export type Watch = {
   summary: string
   // When the watch first went stalled; kept after it recovers or completes.
   stalledAt?: number
+  // The one wake the latest stall earned; replaced when the watch stalls again.
+  wake?: Wake
+}
+
+// pending: stalled, waiting for the main loop to be idle. queued: prompt
+// submitted, its turn not started yet. sent: its turn started. failed: the
+// submit was dropped or threw. off: stalled while /watchdog wake was off.
+export type WakeState = 'pending' | 'queued' | 'sent' | 'failed' | 'off'
+
+export type Wake = {
+  state: WakeState
+  detail: string
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'artifact-watchdog': { watches: Watch[] }
+    // wake: whether a stall may start a turn of its own (default on).
+    'artifact-watchdog': { watches: Watch[]; wake: boolean }
   }
 }

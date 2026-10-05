@@ -1,6 +1,6 @@
 {
   "name": "artifact-watchdog",
   "version": "0.1.0",
-  "description": "Enforces the subagent output contract: watches each Agent dispatch's artifact file, flags a 5-minute stall, offers a Stop button",
+  "description": "Enforces the subagent output contract: watches each Agent dispatch's artifact file, flags a 5-minute stall, wakes an idle Claude once per stall, offers a Stop button",
   "types": "./types/index.d.ts"
 }
