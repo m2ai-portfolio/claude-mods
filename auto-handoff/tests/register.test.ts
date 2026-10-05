@@ -30,6 +30,15 @@ const NOW = {
   presentation: { isFullscreen: false, columns: 80 },
 }
 
+const BAND_PROPS = {
+  hasSurvey: false,
+  isWorking: false,
+  maxRows: 10,
+  bodyColumns: 120,
+  scroll: { offset: 0, bodyRows: 10 },
+  view: {},
+}
+
 type World = {
   tokens: number | undefined
   window: number
@@ -42,6 +51,9 @@ function world(on: On, w: World) {
   const writes: { path: string; text: string }[] = []
   const prompts: string[] = []
   const toasts: string[] = []
+  // Slash commands the mod ran, as typed; a test holds the fork to see "writing".
+  const commands: string[] = []
+  const gate: { hold: Promise<void> | null } = { hold: null }
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/home/apexaipc' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -53,8 +65,11 @@ function world(on: On, w: World) {
   on('session.cwd', () => ({ value: w.cwd }))
   on('session.id', () => ({ value: 'abcdef1234567890' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
-  on('model.fork', ($, e) => {
+  on('model.fork', async ($, e) => {
     prompts.push(e.prompt)
+    if (gate.hold) {
+      await gate.hold
+    }
     return { value: { isAnswered: true, text: w.forkText, usage: USAGE } }
   })
   on('fs.write', ($, e) => {
@@ -62,6 +77,13 @@ function world(on: On, w: World) {
     return { value: undefined }
   })
   on('fs.read', () => ({ value: '' }))
+  // The engine draws nothing of its own in the band; stand in for it when the
+  // mod passes (no run yet, or dismissed).
+  on('ui.render', { component: 'AbovePrompt' }, () => Fragment({}))
+  on('command.run', ($, e) => {
+    commands.push(`/${e.command} ${e.args}`.trim())
+    return { text: '' }
+  })
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
     return { value: undefined }
@@ -81,7 +103,7 @@ function world(on: On, w: World) {
     }
     return bad(`unexpected ${e.argv.join(' ')}`)
   })
-  return { clock, saves, writes, prompts, toasts }
+  return { clock, saves, writes, prompts, toasts, commands, gate }
 }
 
 async function turn($: Parameters<TestBody>[0], agentId?: string) {
@@ -176,5 +198,47 @@ describe('register', () => {
     await t.clock.advance(5)
     expect(t.saves.length).toBe(0)
     expect(t.toasts.at(-1)).toContain('Auto-handoff failed')
+  })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`the band offers clear-and-prime only once the handoff is saved, and it runs both (${surface})`, async ($, on) => {
+      const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+      const t = world(on, w)
+      let release = () => {}
+      t.gate.hold = new Promise<void>(resolve => {
+        release = resolve
+      })
+      await $.session.start({ surface, isInteractive: true, cwd: w.cwd })
+
+      await turn($)
+      await t.clock.advance(5)
+      const ui = await $.ui.mount({ plugin: 'auto-handoff', surface, component: 'AbovePrompt', props: BAND_PROPS })
+      expect(JSON.stringify(await ui.findAll({}))).toContain('Writing auto-handoff')
+      expect(await ui.find({ key: 'pickup' })).toBeUndefined()
+
+      release()
+      await t.clock.advance(5)
+      expect(t.saves.length).toBe(1)
+      expect(await ui.find({ key: 'pickup' })).toBeDefined()
+      expect(t.commands).toEqual([])
+
+      await ui.press({ key: 'pickup' })
+      expect(t.commands).toEqual(['/clear', '/prime my-proj'])
+      expect(await ui.find({ key: 'pickup' })).toBeUndefined()
+    })
+  }
+
+  test('a failed handoff draws no clear-and-prime button', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: 'Sure! Here is a summary.' }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+
+    const ui = await $.ui.mount({ plugin: 'auto-handoff', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
+    expect(JSON.stringify(await ui.findAll({}))).toContain('Auto-handoff failed')
+    expect(await ui.find({ key: 'dismiss' })).toBeDefined()
+    expect(await ui.find({ key: 'pickup' })).toBeUndefined()
+    expect(t.commands).toEqual([])
   })
 })

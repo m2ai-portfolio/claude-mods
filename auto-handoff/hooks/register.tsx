@@ -6,7 +6,8 @@
 // The handoff: $.model.fork drafts it from the session's own transcript (a
 // cached, tool-less question), in the exact /next format; handoff.mjs saves
 // it, moves LATEST and appends DECISIONS.md, as /next's Step 4 does.
-// ui.render (AbovePrompt): what happened and the pickup line (/clear, /prime).
+// ui.render (AbovePrompt): what happened and the pickup line (/clear, /prime);
+// once saved, a button runs both.
 // /auto-handoff: status; "/auto-handoff now" writes one immediately.
 
 import { atom, read, update } from 'claude-code'
@@ -123,9 +124,15 @@ export const register: Register = on => {
           <Text dimColor>{run.path} </Text>
           {dismiss}
         </Box>
-        <Text>
-          To continue fresh: /clear, then /prime {run.project}
-        </Text>
+        <Box flexDirection="row">
+          <Text>To continue fresh: /clear, then /prime {run.project} </Text>
+          <Button
+            key="pickup"
+            label={`Clear and /prime ${run.project}`}
+            variant="primary"
+            onPress={() => clearAndPrime($, run.project)}
+          />
+        </Box>
       </Box>
     )
   })
@@ -289,6 +296,29 @@ async function writeHandoff($: EngineInterface, tokens: number): Promise<void> {
     await fail(String(err).slice(0, 160))
   } finally {
     isWriting = false
+  }
+}
+
+// The pickup line in one press. /clear ends the conversation but not this
+// module (no session.start follows it), so /prime still runs from here.
+// Dismissed first, so a second press cannot clear twice.
+async function clearAndPrime($: EngineInterface, project: string): Promise<void> {
+  await update($, isDismissed, () => true)
+  try {
+    await $.command.run({ command: 'clear' })
+  } catch (err) {
+    await update($, isDismissed, () => false)
+    $.ui.toast(`/clear did not run (${String(err).slice(0, 120)}). Run /clear, then /prime ${project}`, {
+      timeoutMs: 15_000,
+    })
+    return
+  }
+  try {
+    await $.command.run({ command: 'prime', args: project })
+  } catch (err) {
+    $.ui.toast(`Cleared, but /prime did not run (${String(err).slice(0, 120)}). Run /prime ${project}`, {
+      timeoutMs: 15_000,
+    })
   }
 }
 
