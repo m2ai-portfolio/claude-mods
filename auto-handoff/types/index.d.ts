@@ -19,6 +19,12 @@ declare module 'claude-code' {
       crossings: number
       last: HandoffRun | null
       isDismissed: boolean
+      // True once a threshold handoff is saved: the model's main-loop tool
+      // calls are refused until the context drops below the threshold again.
+      isBlocked: boolean
+      // /auto-handoff unblock: no block for the rest of this window, even if
+      // a handoff still being written saves after the command.
+      isLifted: boolean
     }
   }
 }

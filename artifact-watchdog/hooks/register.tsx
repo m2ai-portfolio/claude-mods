@@ -5,8 +5,18 @@
 // start a watch; keep the async agentId so the pane can TaskStop it.
 // session.start: register /watchdog and start the poll timer.
 // Every TICK_MS: stat each live artifact. Growth resets the clock, a last line
-// of "AGENT COMPLETE" closes the watch, and STALL_MS without growth marks it
-// stalled: toast, open the pane, plus a note Claude reads on its next request.
+// of "AGENT COMPLETE" closes the watch. STALL_MS without growth is only half
+// a stall: the agent may be alive and busy (a long test run) without
+// appending. So the agent's own activity is tracked too, from the events that
+// carry its agentId: tool.call (start, and its end when next resolves),
+// turn.step (a model request, start and end) and turn.complete. A tool call
+// or request still in flight counts as active for up to IN_FLIGHT_CAP_MS, so a
+// 6-minute build is not silence but a hung tool still trips. Quiet file +
+// active agent = "quiet": shown on the row, no toast, note or wake. Quiet
+// file + agent silent for SILENT_MS = stalled: toast, open the pane, plus a
+// note Claude reads on its next request. Activity after a stall clears it
+// back to quiet. A watch with no agentId (a foreground agent) has no activity
+// to read and keeps the file-only rule.
 // An agent that finishes without the marker ends its watch ("ended"), so a
 // dead agent's row never turns into a false stall.
 // Wake: a note waits for Claude's next request, and an idle main loop (it
@@ -21,11 +31,17 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Wake, Watch, WatchStatus } from '../types'
+import type { InFlight, Wake, Watch, WatchStatus } from '../types'
 
 const PANE = 'artifact-watchdog'
 const TICK_MS = 15_000
 const STALL_MS = 5 * 60_000
+// How long an agent may go without any event before it counts as silent.
+const SILENT_MS = 2 * 60_000
+// How long one tool call or model request may run and still count as activity.
+const IN_FLIGHT_CAP_MS = 15 * 60_000
+// An agent's activity record is dropped once it has been idle this long.
+const ACTIVITY_TTL_MS = 60 * 60_000
 // How long a pressed Stop may wait on TaskStop (a permission ask, a busy loop)
 // before Claude is told to stop the agent itself.
 const STOP_WAIT_MS = 30_000
@@ -42,7 +58,43 @@ let isTicking = false
 // null, which holds: a hot reload lands when a turn ends.
 let mainTurn: string | null = null
 
+// Per subagent id: its last event and the calls it has running, keyed per
+// call. Module memory, written on every event and copied into the watches at
+// each poll (one state write per tick, not per event). A reload forgets the
+// calls in flight; the copied lastActivityAt carries over.
+type Activity = { lastAt: number; ops: Map<string, InFlight> }
+const activity = new Map<string, Activity>()
+let opSeq = 0
+
 export const register: Register = on => {
+  // Every subagent tool call, start to finish. Outermost, so it times the
+  // whole call (a permission ask included).
+  on('tool.call', async ($, e, next) => {
+    if (e.agentId === undefined) {
+      return next(e)
+    }
+    const done = await begin($, e.agentId, e.tool_use_id ?? `call-${++opSeq}`, e.tool)
+    try {
+      return await next(e)
+    } finally {
+      await done()
+    }
+  })
+
+  // A subagent's model request: thinking and writing a long tool input can
+  // take minutes with no tool call to show for it.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId === undefined) {
+      return yield* next(e)
+    }
+    const done = await begin($, e.agentId, `step-${e.turnId}-${e.index}`, 'model request')
+    try {
+      return yield* next(e)
+    } finally {
+      await done()
+    }
+  })
+
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     home = (await $.env.get('HOME')) ?? home
@@ -90,6 +142,8 @@ export const register: Register = on => {
       mainTurn = null
       // A stall noted mid-turn may never have been read: wake for it now.
       await decideWakes($)
+    } else {
+      touch(e.agentId, await $.clock.now())
     }
 
     return result
@@ -108,6 +162,8 @@ export const register: Register = on => {
       lastGrowthAt: now,
       status: match ? 'waiting' : 'missing',
       summary: match ? '' : 'prompt names no artifact path',
+      lastActivityAt: now,
+      inFlight: null,
     }
     await update($, watches, list => [...list.filter(w => w.id !== watch.id), watch].slice(-50))
     showStatus($, await currentWatches($))
@@ -142,7 +198,8 @@ export const register: Register = on => {
       <Box flexDirection="column">
         <Box flexDirection="row">
           <Text dimColor>
-            Stall after {STALL_MS / 60_000} min without growth · polled every {TICK_MS / 1000}s · wake{' '}
+            Stall after {STALL_MS / 60_000} min without growth and {SILENT_MS / 60_000} min of agent silence ·
+            polled every {TICK_MS / 1000}s · wake{' '}
             {isWaking ? 'on' : 'off'}{' '}
           </Text>
           {list.some(isDone) && (
@@ -182,6 +239,7 @@ export const register: Register = on => {
 const GLYPH: Record<WatchStatus, string> = {
   waiting: '…',
   growing: '▲',
+  quiet: '◇',
   stalled: '■',
   stopping: '◌',
   complete: '✓',
@@ -193,6 +251,7 @@ const GLYPH: Record<WatchStatus, string> = {
 const COLOR: Record<WatchStatus, string> = {
   waiting: 'gray',
   growing: 'green',
+  quiet: 'yellow',
   stalled: 'red',
   stopping: 'yellow',
   complete: 'cyan',
@@ -210,13 +269,72 @@ function detail(w: Watch, now: number): string {
   }
   const idle = Math.round((now - w.lastGrowthAt) / 1000)
   const file = w.path ? w.path.split('/').pop() : ''
+  const quiet = w.status === 'quiet' ? ' · quiet file, agent active' : ''
   const woke = w.status === 'stalled' && w.wake ? ` · ${w.wake.detail}` : ''
-  return `${file} · ${kb(w.lastSize)} · idle ${idle}s${woke}`
+  return `${file} · ${kb(w.lastSize)} · idle ${idle}s${agentDetail(w, now)}${quiet}${woke}`
+}
+
+// The agent half of a live row: what is running now, else its last event.
+function agentDetail(w: Watch, now: number): string {
+  if (w.agentId === null) {
+    return ''
+  }
+  if (w.inFlight) {
+    return ` · ${w.inFlight.what} running ${Math.round((now - w.inFlight.since) / 1000)}s`
+  }
+  const at = w.lastActivityAt ?? w.startedAt
+  return ` · last activity ${Math.round((now - at) / 1000)}s ago`
 }
 
 // Watches the poll still owns. A stopping row belongs to stop() until TaskStop answers.
 function isLive(w: Watch): boolean {
-  return w.status === 'waiting' || w.status === 'growing' || w.status === 'stalled'
+  return w.status === 'waiting' || w.status === 'growing' || w.status === 'quiet' || w.status === 'stalled'
+}
+
+// Records one call starting in a subagent's loop; the returned function
+// records its end. Both count as activity.
+async function begin($: EngineInterface, agentId: string, key: string, what: string): Promise<() => Promise<void>> {
+  const since = await $.clock.now()
+  const record = touch(agentId, since)
+  record.ops.set(key, { what, since })
+  return async () => {
+    record.ops.delete(key)
+    touch(agentId, await $.clock.now().catch(() => since))
+  }
+}
+
+function touch(agentId: string, at: number): Activity {
+  const record = activity.get(agentId) ?? { lastAt: at, ops: new Map<string, InFlight>() }
+  record.lastAt = Math.max(record.lastAt, at)
+  activity.set(agentId, record)
+  return record
+}
+
+// The agent's activity as of now: its last event, and its newest call still
+// running (a later start is the better sign of life).
+function activityOf(w: Watch): { lastActivityAt: number; inFlight: InFlight | null } {
+  const record = w.agentId === null ? undefined : activity.get(w.agentId)
+  const lastActivityAt = Math.max(w.lastActivityAt ?? w.startedAt, record?.lastAt ?? 0)
+  let inFlight: InFlight | null = null
+  for (const op of record?.ops.values() ?? []) {
+    if (inFlight === null || op.since > inFlight.since) {
+      inFlight = op
+    }
+  }
+  return { lastActivityAt, inFlight }
+}
+
+// Active: an event within SILENT_MS, or a call in flight for under
+// IN_FLIGHT_CAP_MS. A watch with no agentId has nothing to read: never active,
+// so it keeps the file-only rule.
+function isAgentActive(w: Watch, seen: { lastActivityAt: number; inFlight: InFlight | null }, now: number): boolean {
+  if (w.agentId === null) {
+    return false
+  }
+  if (seen.inFlight !== null && now - seen.inFlight.since < IN_FLIGHT_CAP_MS) {
+    return true
+  }
+  return now - seen.lastActivityAt < SILENT_MS
 }
 
 function endedWatch(w: Watch, agentStatus: string): Watch {
@@ -238,7 +356,7 @@ async function isWakeOn($: EngineInterface): Promise<boolean> {
 }
 
 function showStatus($: EngineInterface, list: Watch[]): void {
-  const growing = list.filter(w => w.status === 'growing' || w.status === 'waiting').length
+  const growing = list.filter(w => w.status === 'growing' || w.status === 'waiting' || w.status === 'quiet').length
   const stalled = list.filter(w => w.status === 'stalled').length
   if (growing === 0 && stalled === 0) {
     $.ui.status(undefined)
@@ -259,9 +377,14 @@ async function tick($: EngineInterface): Promise<void> {
     const live = (await currentWatches($)).filter(
       w =>
         w.path !== null &&
-        (w.status === 'waiting' || w.status === 'growing' || w.status === 'stalled' || w.status === 'stopping'),
+        (w.status === 'waiting' ||
+          w.status === 'growing' ||
+          w.status === 'quiet' ||
+          w.status === 'stalled' ||
+          w.status === 'stopping'),
     )
     const changes = new Map<string, Partial<Watch>>()
+    const put = (id: string, change: Partial<Watch>) => changes.set(id, { ...changes.get(id), ...change })
     const newlyStalled: Watch[] = []
     let wakeIsOn: boolean | undefined
     // An async agent that hands back without the marker would otherwise sit
@@ -279,27 +402,54 @@ async function tick($: EngineInterface): Promise<void> {
         const text: string = await $.fs.read(path).catch(() => '')
         const lastLine = text.trimEnd().split('\n').pop() ?? ''
         const marker = MARKER_RE.exec(lastLine.trim())
-        changes.set(
+        put(
           w.id,
           marker
             ? { status: 'complete', lastSize: size, lastGrowthAt: now, summary: marker[1] ?? '' }
             : { status: 'growing', lastSize: size, lastGrowthAt: now },
         )
       }
+      const seen = activityOf(w)
+      if (isLive(w) && (seen.lastActivityAt !== w.lastActivityAt || seen.inFlight?.since !== w.inFlight?.since)) {
+        put(w.id, seen)
+      }
       if (hasEnded && changes.get(w.id)?.status !== 'complete') {
         const { status: ended, summary } = endedWatch(w, status ?? 'ended')
-        changes.set(w.id, { ...changes.get(w.id), status: ended, summary })
-      } else if (
-        !changes.has(w.id) &&
-        (w.status === 'waiting' || w.status === 'growing') &&
-        now - w.lastGrowthAt >= STALL_MS
-      ) {
-        // Each stall gets a fresh wake, so one that recovers and stalls again
-        // earns one more. The switch is read as the stall lands; decideWakes
-        // sends the pending ones.
-        wakeIsOn ??= await isWakeOn($)
-        changes.set(w.id, { status: 'stalled', stalledAt: w.stalledAt ?? now, wake: wakeIsOn ? PENDING : OFF })
-        newlyStalled.push(w)
+        put(w.id, { status: ended, summary })
+      } else if (changes.get(w.id)?.status === undefined && isLive(w) && now - w.lastGrowthAt >= STALL_MS) {
+        if (isAgentActive(w, seen, now)) {
+          // The file is quiet but the agent is working: say so, raise nothing.
+          // A stalled row whose agent came back to life clears here too.
+          if (w.status !== 'quiet') {
+            put(w.id, { status: 'quiet' })
+          }
+        } else if (w.status !== 'stalled') {
+          if (w.lastStallAt !== undefined && w.lastStallAt >= w.lastGrowthAt) {
+            // Stalled already since the file last grew, cleared only by agent
+            // activity: the same stall back. Keep its wake; raise nothing new,
+            // or an agent that flickers between work and silence would wake
+            // Claude every few minutes.
+            put(w.id, { status: 'stalled' })
+          } else {
+            // Each stall after growth gets a fresh wake, so one that recovers
+            // and stalls again earns one more. The switch is read as the stall
+            // lands; decideWakes sends the pending ones.
+            wakeIsOn ??= await isWakeOn($)
+            put(w.id, {
+              status: 'stalled',
+              stalledAt: w.stalledAt ?? now,
+              lastStallAt: now,
+              wake: wakeIsOn ? PENDING : OFF,
+            })
+            newlyStalled.push(w)
+          }
+        }
+      }
+    }
+    // Forget agents long idle with nothing running.
+    for (const [agentId, record] of activity) {
+      if (record.ops.size === 0 && now - record.lastAt > ACTIVITY_TTL_MS) {
+        activity.delete(agentId)
       }
     }
 

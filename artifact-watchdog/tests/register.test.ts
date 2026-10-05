@@ -73,7 +73,23 @@ function world(on: On, file: { size: number; text: string }, isForeground = fals
   })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
-  return { clock, toasts, statuses, stops, gate, agent, opens, submits, submit }
+  // A subagent's own tool calls and model requests; a test holds one open to
+  // model a long test run or a long generation.
+  const busy: { hold: Promise<void> | null } = { hold: null }
+  on('tool.call', { tool: 'Bash' }, async () => {
+    if (busy.hold) {
+      await busy.hold
+    }
+    return { result: { stdout: '', stderr: '', interrupted: false } }
+  })
+  on('turn.step', async function* ($, e) {
+    if (busy.hold) {
+      await busy.hold
+    }
+    yield* []
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null }
+  })
+  return { clock, toasts, statuses, stops, gate, agent, opens, submits, submit, busy }
 }
 
 // The pane's whole drawing as text, for checking what a row says.
@@ -487,4 +503,154 @@ describe('wake on stall', () => {
       expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
     })
   }
+})
+
+// One tool call in agent-7's own loop, run to its end.
+async function agentCall($: Parameters<TestBody>[0], n: number) {
+  await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: `b${n}`, agentId: 'agent-7' })
+}
+
+// Holds the world's next agent call open until the returned release runs.
+function hold(w: ReturnType<typeof world>): () => void {
+  let release = () => {}
+  w.busy.hold = new Promise<void>(resolve => {
+    release = () => {
+      w.busy.hold = null
+      resolve()
+    }
+  })
+  return release
+}
+
+describe('agent activity', () => {
+  test('a quiet file with an active agent shows quiet, never stalls or wakes', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'ta', description: 'probe', prompt: PROMPT })
+    file.size = 60
+    file.text = '# Report\n'
+    await w.clock.advance(15_000)
+
+    // A call a minute for 12 minutes, the file never growing again.
+    for (let n = 0; n < 12; n++) {
+      await w.clock.advance(60_000)
+      await agentCall($, n)
+    }
+    await w.clock.advance(15_000)
+    expect(w.toasts).toEqual([])
+    expect(w.submits).toEqual([])
+    expect(w.opens).toEqual([])
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 running')
+    const pane = await paneText($)
+    expect(pane).toContain('quiet file, agent active')
+    expect(pane).toContain('last activity 15s ago')
+  })
+
+  test('a quiet file with a silent agent stalls once both windows pass', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'ts', description: 'probe', prompt: PROMPT })
+    file.size = 60
+    file.text = '# Report\n'
+    await w.clock.advance(15_000)
+
+    // Last sign of life at about 4.5 min: the file window passes at 5:15, but
+    // the agent is not silent for 2 min until about 6:30.
+    await w.clock.advance(4 * 60_000)
+    await agentCall($, 1)
+    await w.clock.advance(60_000)
+    expect(w.toasts).toEqual([])
+    expect(await paneText($)).toContain('quiet file, agent active')
+
+    await w.clock.advance(75_000)
+    expect(w.toasts.length).toBe(1)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(w.submits.length).toBe(1)
+  })
+
+  test('a long tool call in flight counts as active until the 15 min cap', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tl', description: 'probe', prompt: PROMPT })
+    file.size = 60
+    file.text = '# Report\n'
+    await w.clock.advance(15_000)
+
+    const release = hold(w)
+    const running = agentCall($, 1)
+    await w.clock.advance(10 * 60_000)
+    expect(w.toasts).toEqual([])
+    expect(await paneText($)).toContain('Bash running 600s')
+
+    // Past the cap the call is treated as hung: silent since it started.
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.toasts.length).toBe(1)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    release()
+    await running
+  })
+
+  test('a long model request in flight counts as active', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tm', description: 'probe', prompt: PROMPT })
+
+    const release = hold(w)
+    const streaming = (async () => {
+      for await (const chunk of $.turn.step({ turnId: 'sub', index: 0, model: 'm', messageCount: 3, agentId: 'agent-7' })) {
+        void chunk
+      }
+    })()
+    await w.clock.advance(8 * 60_000)
+    expect(w.toasts).toEqual([])
+    expect(await paneText($)).toContain('model request running')
+    release()
+    await streaming
+
+    await w.clock.advance(2 * 60_000 + 15_000)
+    expect(w.toasts.length).toBe(1)
+  })
+
+  test('activity after a stall clears it; going silent again resumes the same stall without a second wake', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await dispatchAndStall($, w, file)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(w.submits.length).toBe(1)
+
+    await agentCall($, 1)
+    await w.clock.advance(15_000)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 running')
+    expect(await paneText($)).toContain('quiet file, agent active')
+
+    await w.clock.advance(2 * 60_000)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(w.submits.length).toBe(1)
+    expect(w.toasts.length).toBe(1)
+
+    // Growth, then a fresh stall: that one earns its own wake.
+    file.size = 140
+    file.text = '# Report\n## More\n'
+    await w.clock.advance(15_000)
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.submits.length).toBe(2)
+    expect(w.toasts.length).toBe(2)
+  })
+
+  test("another agent's activity does not keep a silent one alive", async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'to', description: 'probe', prompt: PROMPT })
+    for (let n = 0; n < 6; n++) {
+      await w.clock.advance(60_000)
+      await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: `o${n}`, agentId: 'agent-other' })
+    }
+    await w.clock.advance(15_000)
+    expect(w.toasts.length).toBe(1)
+  })
 })
