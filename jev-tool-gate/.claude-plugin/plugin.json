@@ -1,0 +1,22 @@
+{
+  "name": "jev-tool-gate",
+  "version": "0.1.0",
+  "description": "Log-only Jev judgment of risky tool calls (destructive? requested by fetched content?). Never changes a decision; hosted calls off by default.",
+  "author": {
+    "name": "Matthew Snow"
+  },
+  "userConfig": {
+    "tools": {
+      "type": "string",
+      "title": "Tools judged",
+      "description": "Comma-separated tool names to judge; empty uses Bash,Write,Edit,NotebookEdit",
+      "default": ""
+    },
+    "mcpVerbs": {
+      "type": "string",
+      "title": "MCP verbs judged",
+      "description": "Comma-separated words; an MCP tool whose own name contains one is judged. Empty uses send,delete,post,publish,trash,transfer",
+      "default": ""
+    }
+  }
+}
