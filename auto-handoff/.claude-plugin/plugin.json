@@ -1,0 +1,6 @@
+{
+  "name": "auto-handoff",
+  "version": "0.1.0",
+  "description": "Writes a /next handoff automatically once a 1M-token session crosses 300k tokens, so the next session can /prime from it",
+  "types": "./types/index.d.ts"
+}
