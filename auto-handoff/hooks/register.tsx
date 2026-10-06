@@ -7,7 +7,12 @@
 // cached, tool-less question), in the exact /next format; handoff.mjs saves
 // it, moves LATEST and appends DECISIONS.md, as /next's Step 4 does.
 // ui.render (AbovePrompt): what happened and the pickup line (/clear, /prime);
-// once saved, a button runs both.
+// once saved, a button runs both. On the desktop a "Retire this session"
+// toggle turns that button into "Retire session": rename this session to
+// "⛔ HANDED OFF: /prime <project>", copy the /prime line, and archive it, so
+// the pickup happens in a new session and this one is not reopened by mistake.
+// (/clear keeps the same sidebar session, so the plain button leaves nothing
+// old behind; retiring is for picking up somewhere else.)
 // tool.call (main loop): once a threshold handoff is SAVED, the model's own
 // tool calls are refused with a reason telling it to stop and hand Matthew the
 // pickup line. Never while writing, never after a failed write, never in a
@@ -18,7 +23,7 @@
 // block for the rest of this window.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { HandoffRun } from '../types'
 
@@ -29,6 +34,8 @@ const THRESHOLD = 300_000
 // asks for exactly this call. Nothing else is needed to wrap up: the answer
 // that tells Matthew to clear is plain text, and the handoff is already saved.
 const WRAP_UP_TOOLS: ReadonlySet<string> = new Set(['TaskStop'])
+// The desktop app's session tools, reached with the engine's own connection.
+const SESSIONS = 'ccd_session_mgmt'
 
 const isArmed = atom({ plugin: 'auto-handoff', key: 'isArmed' } as const, true)
 const crossings = atom({ plugin: 'auto-handoff', key: 'crossings' } as const, 0)
@@ -36,8 +43,11 @@ const last = atom({ plugin: 'auto-handoff', key: 'last' } as const, null)
 const isDismissed = atom({ plugin: 'auto-handoff', key: 'isDismissed' } as const, false)
 const isBlocked = atom({ plugin: 'auto-handoff', key: 'isBlocked' } as const, false)
 const isLifted = atom({ plugin: 'auto-handoff', key: 'isLifted' } as const, false)
+const isRetiring = atom({ plugin: 'auto-handoff', key: 'isRetiring' } as const, false)
 
 let isWriting = false
+// A retire in flight: a second press must not rename or archive twice.
+let isRetiringNow = false
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
@@ -157,6 +167,9 @@ export const register: Register = on => {
         </Box>
       )
     }
+    // Only the desktop app has a sidebar session to rename and archive.
+    const canRetire = e.surface === 'desktop'
+    const retiring = canRetire && (await read($, isRetiring))
     return (
       <Box flexDirection="column" paddingX={1}>
         <Box flexDirection="row">
@@ -167,13 +180,25 @@ export const register: Register = on => {
           {!blocked && dismiss}
         </Box>
         <Box flexDirection="row">
-          <Text>To continue fresh: /clear, then /prime {run.project} </Text>
+          {retiring ? (
+            <Text>To continue in a new session: retire this one, then /prime {run.project} there </Text>
+          ) : (
+            <Text>To continue fresh: /clear, then /prime {run.project} </Text>
+          )}
           <Button
             key="pickup"
-            label={`Clear and /prime ${run.project}`}
+            label={retiring ? 'Retire session' : `Clear and /prime ${run.project}`}
             variant="primary"
-            onPress={() => clearAndPrime($, run.project)}
+            onPress={press => (retiring ? retire($, run.project, press.surface) : clearAndPrime($, run.project))}
           />
+          {canRetire && (
+            <Button
+              key="retire"
+              label={`${retiring ? '[x]' : '[ ]'} Retire this session`}
+              plain
+              onPress={() => update($, isRetiring, v => !v)}
+            />
+          )}
         </Box>
         {blocked && (
           <Box flexDirection="row">
@@ -414,6 +439,51 @@ async function clearAndPrime($: EngineInterface, project: string): Promise<void>
     $.ui.toast(`Cleared, but /prime did not run (${String(err).slice(0, 120)}). Run /prime ${project}`, {
       timeoutMs: 15_000,
     })
+  }
+}
+
+// Retire: mark this session so it is not reopened, then archive it; the pickup
+// happens in a new session. Rename first, so a declined or failed archive
+// still leaves the session labelled. The archive ends the conversation, so
+// nothing after a successful one runs here.
+async function retire($: EngineInterface, project: string, surface: RenderSurface): Promise<void> {
+  if (isRetiringNow) {
+    return
+  }
+  isRetiringNow = true
+  try {
+    const pickup = `/prime ${project}`
+    const renamed = await sessions($, 'set_session_title', { session_id: 'self', title: `⛔ HANDED OFF: ${pickup}` })
+    const copied = await $.ui.copy({ text: pickup, surface }).catch(() => ({ isCopied: false }))
+    const archived = await sessions($, 'archive_session', {
+      session_id: 'self',
+      reason: `Auto-handoff saved; continue with ${pickup} in a new session`,
+    })
+    if (archived.ok) {
+      $.ui.toast(`Session retired. In a new session run ${pickup}${copied.isCopied ? ' (copied)' : ''}`, { timeoutMs: 15_000 })
+      return
+    }
+    $.ui.toast(
+      `${renamed.ok ? 'Renamed' : `Rename failed (${renamed.detail.slice(0, 80)})`}; archive did not happen ` +
+        `(${archived.detail.slice(0, 120)}). Archive it from the sidebar, then ${pickup} in a new session.`,
+      { timeoutMs: 20_000 },
+    )
+  } finally {
+    isRetiringNow = false
+  }
+}
+
+async function sessions(
+  $: EngineInterface,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<{ ok: boolean; detail: string }> {
+  try {
+    const r = await $.mcp.call(SESSIONS, tool, args)
+    const detail = r.content.map(b => b.text ?? '').join(' ').trim()
+    return { ok: !r.isError, detail: detail || (r.isError ? 'no reason given' : '') }
+  } catch (err) {
+    return { ok: false, detail: String(err) }
   }
 }
 

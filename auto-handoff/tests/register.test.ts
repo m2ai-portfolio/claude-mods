@@ -44,6 +44,8 @@ type World = {
   window: number
   cwd: string
   forkText: string
+  // The desktop app's answer to archive_session; absent, it archives.
+  archiveError?: string
 }
 
 function world(on: On, w: World) {
@@ -56,6 +58,9 @@ function world(on: On, w: World) {
   const gate: { hold: Promise<void> | null } = { hold: null }
   // Tool calls that got past the mod to the world, by tool name.
   const ran: string[] = []
+  // Desktop session tools the mod called, as "tool title-or-session".
+  const sessions: string[] = []
+  const copies: string[] = []
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/home/apexaipc' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -90,6 +95,15 @@ function world(on: On, w: World) {
     ran.push(e.tool)
     return { result: 'ran' }
   })
+  on('mcp.call', ($, e) => {
+    sessions.push(`${e.server} ${e.tool} ${String(e.args.title ?? e.args.session_id)}`)
+    const failed = e.tool === 'archive_session' && w.archiveError !== undefined
+    return { value: { content: [{ type: 'text', text: failed ? w.archiveError! : 'ok' }], isError: failed } }
+  })
+  on('ui.copy', ($, e) => {
+    copies.push(e.text)
+    return { value: { isCopied: true } }
+  })
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
     return { value: undefined }
@@ -109,7 +123,7 @@ function world(on: On, w: World) {
     }
     return bad(`unexpected ${e.argv.join(' ')}`)
   })
-  return { clock, saves, writes, prompts, toasts, commands, gate, ran }
+  return { clock, saves, writes, prompts, toasts, commands, gate, ran, sessions, copies }
 }
 
 async function turn($: Parameters<TestBody>[0], agentId?: string) {
@@ -246,6 +260,59 @@ describe('register', () => {
     expect(await ui.find({ key: 'dismiss' })).toBeDefined()
     expect(await ui.find({ key: 'pickup' })).toBeUndefined()
     expect(t.commands).toEqual([])
+  })
+})
+
+describe('retire toggle', () => {
+  async function saved($: Parameters<TestBody>[0], on: On, surface: 'terminal' | 'desktop', archiveError?: string) {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT, archiveError }
+    const t = world(on, w)
+    await $.session.start({ surface, isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    const ui = await $.ui.mount({ plugin: 'auto-handoff', surface, component: 'AbovePrompt', props: BAND_PROPS })
+    return { t, ui }
+  }
+
+  test('the terminal draws no retire toggle: there is no sidebar session to archive', async ($, on) => {
+    const { ui } = await saved($, on, 'terminal')
+    expect(await ui.find({ key: 'pickup' })).toBeDefined()
+    expect(await ui.find({ key: 'retire' })).toBeUndefined()
+  })
+
+  test('unchecked, the desktop pickup still clears and primes, touching no session tool', async ($, on) => {
+    const { t, ui } = await saved($, on, 'desktop')
+    expect(JSON.stringify(await ui.find({ key: 'retire' }))).toContain('[ ] Retire this session')
+    await ui.press({ key: 'pickup' })
+    expect(t.commands).toEqual(['/clear', '/prime my-proj'])
+    expect(t.sessions).toEqual([])
+  })
+
+  test('checked, the pickup renames, copies /prime and archives instead of clearing', async ($, on) => {
+    const { t, ui } = await saved($, on, 'desktop')
+    await ui.press({ key: 'retire' })
+    expect(JSON.stringify(await ui.find({ key: 'retire' }))).toContain('[x] Retire this session')
+    expect(JSON.stringify(await ui.find({ key: 'pickup' }))).toContain('Retire session')
+
+    await ui.press({ key: 'pickup' })
+    expect(t.sessions).toEqual([
+      'ccd_session_mgmt set_session_title ⛔ HANDED OFF: /prime my-proj',
+      'ccd_session_mgmt archive_session self',
+    ])
+    expect(t.copies).toEqual(['/prime my-proj'])
+    expect(t.commands).toEqual([])
+    expect(t.toasts.at(-1)).toContain('Session retired')
+  })
+
+  test('a declined archive keeps the rename and says how to finish by hand', async ($, on) => {
+    const { t, ui } = await saved($, on, 'desktop', 'The user declined')
+    await ui.press({ key: 'retire' })
+    await ui.press({ key: 'pickup' })
+    expect(t.sessions.length).toBe(2)
+    expect(t.toasts.at(-1)).toContain('Renamed; archive did not happen (The user declined)')
+    expect(t.toasts.at(-1)).toContain('/prime my-proj in a new session')
+    // The band stays, so the toggle can be unchecked and Clear and /prime used instead.
+    expect(await ui.find({ key: 'pickup' })).toBeDefined()
   })
 })
 

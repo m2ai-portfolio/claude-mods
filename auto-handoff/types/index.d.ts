@@ -25,6 +25,9 @@ declare module 'claude-code' {
       // /auto-handoff unblock: no block for the rest of this window, even if
       // a handoff still being written saves after the command.
       isLifted: boolean
+      // The band's "Retire this session" toggle: the pickup button renames and
+      // archives this session instead of clearing it (desktop only).
+      isRetiring: boolean
     }
   }
 }
