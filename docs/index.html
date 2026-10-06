@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto-handoff for Claude Code</title>
+<meta name="description" content="Two short videos: what the auto-handoff mod does, and how to set it up in about two minutes.">
+<meta property="og:title" content="Auto-handoff for Claude Code">
+<meta property="og:description" content="What it does, and a two-minute setup walkthrough.">
+<meta property="og:image" content="https://m2ai-portfolio.github.io/claude-mods/media/auto-handoff-explained.jpg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=EB+Garamond:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #faf8f4; --surface: #f1ebe0; --ink: #1c1b19; --muted: #6b6760;
+    --line: #e2dccf; --accent: #c4674a; --term: #1c1b19; --term-ink: #ece8df; --term-dim: #8f8a80; --link: #2f7d6d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #161513; --surface: #201e1b; --ink: #ece8df; --muted: #a39e94;
+      --line: #2f2c27; --accent: #e07e60; --term: #0e0d0c; --term-ink: #ece8df; --term-dim: #8f8a80; --link: #6cc3ad;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #161513; --surface: #201e1b; --ink: #ece8df; --muted: #a39e94;
+    --line: #2f2c27; --accent: #e07e60; --term: #0e0d0c; --term-ink: #ece8df; --term-dim: #8f8a80; --link: #6cc3ad;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 400 19px/1.55 "EB Garamond", Georgia, serif;
+    background-image: linear-gradient(var(--line) 1px, transparent 1px), linear-gradient(90deg, var(--line) 1px, transparent 1px);
+    background-size: 64px 64px; background-attachment: fixed;
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 56px 16px 80px; }
+  .kicker { font: 500 12px/1 "JetBrains Mono", monospace; letter-spacing: .18em; text-transform: uppercase; color: var(--muted); }
+  .kicker::before { content: "\2731  "; color: var(--accent); }
+  h1 { font-weight: 400; font-size: clamp(38px, 7vw, 60px); line-height: 1.05; margin: 14px 0 12px; letter-spacing: -.01em; }
+  .lede { font-size: 21px; color: var(--muted); max-width: 640px; margin: 0 0 44px; }
+  section.video { margin: 0 0 52px; }
+  .vhead { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+  .num { font-size: 40px; line-height: 1; color: var(--accent); }
+  h2 { font-weight: 500; font-size: 27px; margin: 0; }
+  .dur { font: 400 13px/1 "JetBrains Mono", monospace; color: var(--muted); margin-left: auto; }
+  .frame { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+  video { display: block; width: 100%; height: auto; aspect-ratio: 16 / 9; border-radius: 6px; background: #000; }
+  .vdesc { color: var(--muted); margin: 12px 2px 0; }
+  h3 { font-weight: 500; font-size: 24px; margin: 8px 0 12px; }
+  .term { background: var(--term); color: var(--term-ink); border-radius: 10px; overflow: hidden; margin: 0 0 14px; }
+  .term .bar { padding: 10px 14px; font: 400 12px/1 "JetBrains Mono", monospace; color: var(--term-dim); border-bottom: 1px solid #2a2824; }
+  .term pre { margin: 0; padding: 16px 18px; overflow-x: auto; font: 400 14px/1.7 "JetBrains Mono", monospace; }
+  .term .p { color: var(--term-dim); user-select: none; }
+  ol.steps { padding-left: 22px; margin: 0 0 18px; }
+  ol.steps li { margin: 0 0 6px; }
+  code { font: 400 .82em "JetBrains Mono", monospace; background: var(--surface); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+  a { color: var(--link); text-underline-offset: 3px; }
+  footer { border-top: 1px solid var(--line); margin-top: 56px; padding-top: 20px; font-size: 16px; color: var(--muted); display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<main>
+  <div class="kicker">claude-mods</div>
+  <h1>Auto-handoff for Claude Code</h1>
+  <p class="lede">A long Claude session loses its thread the moment you clear it. Auto-handoff writes a handoff for you before that happens, so the next session picks up where you left off.</p>
+
+  <section class="video" id="explained">
+    <div class="vhead"><span class="num">1</span><h2>What it does</h2><span class="dur">0:33</span></div>
+    <div class="frame">
+      <video controls preload="metadata" playsinline poster="media/auto-handoff-explained.jpg">
+        <source src="media/auto-handoff-explained.mp4" type="video/mp4">
+        <a href="media/auto-handoff-explained.mp4">Download the video (MP4)</a>
+      </video>
+    </div>
+    <p class="vdesc">At a token threshold, the mod saves a <code>/next</code> handoff on its own, then tells you to clear and run <code>/prime</code>.</p>
+  </section>
+
+  <section class="video" id="setup">
+    <div class="vhead"><span class="num">2</span><h2>Set it up in about two minutes</h2><span class="dur">0:43</span></div>
+    <div class="frame">
+      <video controls preload="metadata" playsinline poster="media/auto-handoff-setup.jpg">
+        <source src="media/auto-handoff-setup.mp4" type="video/mp4">
+        <a href="media/auto-handoff-setup.mp4">Download the video (MP4)</a>
+      </video>
+    </div>
+    <p class="vdesc">You need Claude Code, Node 18 or newer, and a model with a one million token context window.</p>
+  </section>
+
+  <h3>The steps from the video</h3>
+  <ol class="steps">
+    <li>Clone the repo and copy the two skills:</li>
+  </ol>
+  <div class="term">
+    <div class="bar">terminal</div>
+    <pre><span class="p">$ </span>git clone https://github.com/m2ai-portfolio/claude-mods ~/.claude/mods
+<span class="p">$ </span>cp -r ~/.claude/mods/skills/next ~/.claude/mods/skills/prime ~/.claude/skills/</pre>
+  </div>
+  <ol class="steps" start="2">
+    <li>In <code>~/.claude/settings.json</code>, point <code>CLAUDE_CODE_PLUGIN_DIRS</code> under <code>env</code> at the mod's folder, using the full path:</li>
+  </ol>
+  <div class="term">
+    <div class="bar">~/.claude/settings.json</div>
+    <pre>"env": { "CLAUDE_CODE_PLUGIN_DIRS": "/home/you/.claude/mods/auto-handoff" }</pre>
+  </div>
+  <ol class="steps" start="3">
+    <li>Start a new chat (mods load at session start) and type <code>/auto-handoff</code>. It reports the trigger point.</li>
+    <li>To prove it now, run <code>/auto-handoff now</code> after your first reply. When the band says saved, you are set.</li>
+  </ol>
+
+  <footer>
+    <a href="https://github.com/m2ai-portfolio/claude-mods">Source on GitHub</a>
+    <a href="https://github.com/m2ai-portfolio/claude-mods/tree/main/skills">/next and /prime skills</a>
+    <a href="https://github.com/m2ai-portfolio">M2AI</a>
+  </footer>
+</main>
+</body>
+</html>
