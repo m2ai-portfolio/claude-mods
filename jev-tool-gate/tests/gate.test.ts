@@ -242,6 +242,46 @@ describe('hosted switch', () => {
     expect(w.lines[0]?.inputHash).toBe(w.lines[1]?.inputHash ?? 'missing')
   })
 
+  test('a prompt that lands mid-judgment moves neither the question nor the cache key', async ($, on) => {
+    // The key read sits between the cache key and the request: the first one
+    // is held there while a new operator prompt arrives.
+    let reached = () => {}
+    const atKeyRead = new Promise<void>(resolve => {
+      reached = resolve
+    })
+    let release = () => {}
+    const held = new Promise<void>(resolve => {
+      release = resolve
+    })
+    let isHeld = false
+    on('env.get', { name: 'TYPESAFE_API_KEY' }, async ($, e, next) => {
+      if (!isHeld) {
+        isHeld = true
+        reached()
+        await held
+      }
+      return next(e)
+    })
+    const w = world(on, { hosted: true })
+    await start($)
+    await $.prompt.submit({ text: 'first prompt', origin: { kind: 'composer' } } as never)
+    const checking = check($, 'Bash', { command: 'rm -rf build' }, 'p1')
+    await atKeyRead
+    await $.prompt.submit({ text: 'second prompt', origin: { kind: 'composer' } } as never)
+    release()
+    await checking
+    const asked = () =>
+      w.requests.map(r => (JSON.parse(r.body) as { state: { operator_request: string } }).state.operator_request)
+    // Asked under the prompt captured when the check began, not the one that landed.
+    expect(asked()).toEqual(['first prompt'])
+    // Cached under that same prompt: the second prompt asks again, the first hits.
+    await check($, 'Bash', { command: 'rm -rf build' }, 'p2')
+    await $.prompt.submit({ text: 'first prompt', origin: { kind: 'composer' } } as never)
+    await check($, 'Bash', { command: 'rm -rf build' }, 'p3')
+    expect(asked()).toEqual(['first prompt', 'second prompt'])
+    expect(w.lines.map(l => l.cached)).toEqual([false, false, true])
+  })
+
   test('hosted on without a key: no call, error no_api_key', async ($, on) => {
     const w = world(on, { hosted: true, withKey: false })
     await start($)

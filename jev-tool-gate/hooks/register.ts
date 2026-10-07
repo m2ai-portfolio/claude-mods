@@ -278,6 +278,9 @@ async function observe(
   verdict: { decision: string; rule?: string },
   signal: AbortSignal,
 ): Promise<void> {
+  // Read once, before any await: a prompt that lands mid-judgment must not
+  // ask under one prompt and cache under another.
+  const prompt = lastPrompt
   const started = await $.clock.now()
   sessionId ??= await $.session.id().catch(() => null)
   const rendered = renderRedacted(input)
@@ -285,7 +288,7 @@ async function observe(
   // The fetchedRequest question reads operator_request, so a judgment holds
   // only for the prompt it was asked under: the same input after a new prompt
   // asks again. inputHash stays input-only, so log lines still group by input.
-  const cacheKey = await sha256Hex(`${inputHash}\n${lastPrompt}`)
+  const cacheKey = await sha256Hex(`${inputHash}\n${prompt}`)
   const entry: LogLine = {
     ts: new Date(started).toISOString(),
     sessionId,
@@ -322,7 +325,7 @@ async function observe(
         if (signal.aborted) {
           throw new JudgmentError('aborted')
         }
-        const request = buildRequest({ tool, input: cap(rendered, INPUT_CAP), operator_request: lastPrompt })
+        const request = buildRequest({ tool, input: cap(rendered, INPUT_CAP), operator_request: prompt })
         const pending = askJev($, key, request)
         cache.set(cacheKey, pending)
         while (cache.size > CACHE_MAX) {
