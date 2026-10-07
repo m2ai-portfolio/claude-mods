@@ -46,8 +46,8 @@ import {
   inScope,
   parseList,
   redact,
+  renderRedacted,
   sha256Hex,
-  stableJson,
 } from './redact'
 import type { Scope } from './redact'
 
@@ -98,6 +98,8 @@ let lastPrompt = ''
 let sessionId: string | null = null
 let home: string | null = null
 let apiKey: string | null = null
+// Names this session's fallback log when the engine gives no session id.
+const fallbackId = `pid-${Math.random().toString(36).slice(2, 10)}`
 let sink: Promise<void> = Promise.resolve()
 
 class JudgmentError extends Error {}
@@ -198,8 +200,10 @@ async function askJev($: EngineInterface, key: string, request: JevRequest): Pro
 }
 
 // Append one line. A shell append (O_APPEND) is safe when several sessions
-// write at once; where $.process is not offered (not the CLI) fall back to
-// read-and-rewrite, which never clobbers: an unreadable file drops the line.
+// write at once. Where $.process is not offered (not the CLI) there is no
+// atomic append, and a read-and-rewrite of the shared log lets two sessions
+// overwrite each other's line. So the fallback rewrites this session's own
+// file (jev-tool-gate.<session>.jsonl), which only this session's sink touches.
 async function append($: EngineInterface, line: string): Promise<void> {
   const path = await logPath($)
   const script =
@@ -214,9 +218,15 @@ async function append($: EngineInterface, line: string): Promise<void> {
   } catch {
     // fall through to the file API
   }
-  const exists = await $.fs.exists(path)
-  const before = exists ? await $.fs.read(path) : ''
-  await $.fs.write(path, `${before}${line}\n`)
+  const own = sessionLogPath(path)
+  const exists = await $.fs.exists(own)
+  const before = exists ? await $.fs.read(own) : ''
+  await $.fs.write(own, `${before}${line}\n`)
+}
+
+export function sessionLogPath(shared: string, session: string | null = sessionId): string {
+  const name = (session ?? fallbackId).replace(/[^\w-]/g, '_')
+  return shared.replace(/\.jsonl$/, `.${name}.jsonl`)
 }
 
 function writeLine($: EngineInterface, entry: LogLine): Promise<void> {
@@ -261,8 +271,12 @@ async function observe(
 ): Promise<void> {
   const started = await $.clock.now()
   sessionId ??= await $.session.id().catch(() => null)
-  const rendered = redact(stableJson(input))
+  const rendered = renderRedacted(input)
   const inputHash = (await sha256Hex(`${QUESTION_VERSION}\n${tool}\n${rendered}`)).slice(0, 32)
+  // The fetchedRequest question reads operator_request, so a judgment holds
+  // only for the prompt it was asked under: the same input after a new prompt
+  // asks again. inputHash stays input-only, so log lines still group by input.
+  const cacheKey = await sha256Hex(`${inputHash}\n${lastPrompt}`)
   const entry: LogLine = {
     ts: new Date(started).toISOString(),
     sessionId,
@@ -285,7 +299,7 @@ async function observe(
   }
 
   if (await isHosted($)) {
-    const hit = cache.get(inputHash)
+    const hit = cache.get(cacheKey)
     try {
       let judgment: Judgment
       if (hit !== undefined) {
@@ -301,14 +315,14 @@ async function observe(
         }
         const request = buildRequest({ tool, input: cap(rendered, INPUT_CAP), operator_request: lastPrompt })
         const pending = askJev($, key, request)
-        cache.set(inputHash, pending)
+        cache.set(cacheKey, pending)
         while (cache.size > CACHE_MAX) {
           const oldest = cache.keys().next().value
           if (oldest === undefined) break
           cache.delete(oldest)
         }
         // Errors are not cached: the next identical call may ask again.
-        pending.catch(() => cache.delete(inputHash))
+        pending.catch(() => cache.delete(cacheKey))
         judgment = await pending
       }
       entry.judged = true

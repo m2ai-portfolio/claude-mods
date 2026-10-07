@@ -1,7 +1,7 @@
 import { describe, expect, test, tier } from 'claude-code/testing'
 
 import { isLowConfidence, validateJevResponse, buildRequest } from '../hooks/jev'
-import { inScope, redact, stableJson } from '../hooks/redact'
+import { inScope, redact, renderRedacted, stableJson } from '../hooks/redact'
 
 tier('user')
 
@@ -113,5 +113,35 @@ describe('validateJevResponse', () => {
     expect(isLowConfidence(validateJevResponse(request, good))).toBe(false)
     const unsure = { ...good, answers: { ...good.answers, destructive: { type: 'noul', noul: 0.6 } } }
     expect(isLowConfidence(validateJevResponse(request, unsure))).toBe(true)
+  })
+})
+
+describe('renderRedacted: secrets JSON escaping would hide', () => {
+  // Fake values only.
+  test('a quoted shell assignment inside a tool input', () => {
+    const out = renderRedacted({ command: 'API_KEY="hunter2hunter2" curl https://x' })
+    expect(out).not.toContain('hunter2hunter2')
+    expect(out).toContain('API_KEY=')
+  })
+
+  test('escaped quotes already in the string', () => {
+    const out = renderRedacted({ command: 'echo "API_KEY=\\"hunter2hunter2\\""' })
+    expect(out).not.toContain('hunter2hunter2')
+  })
+
+  test('JSON embedded in Write content', () => {
+    const out = renderRedacted({ file_path: '/x/c.json', content: '{"client_secret": "hunter2hunter2", "n": 1}' })
+    expect(out).not.toContain('hunter2hunter2')
+    expect(out).toContain('client_secret')
+  })
+
+  test('nested arrays and objects are walked', () => {
+    const out = renderRedacted({ a: [{ b: 'password=hunter2hunter2' }], n: 3, ok: true })
+    expect(out).not.toContain('hunter2hunter2')
+    expect(out).toContain('"n":3')
+  })
+
+  test('a redacted escaped value inside serialized JSON', () => {
+    expect(redact(stableJson({ c: 'TOKEN="hunter2hunter2"' }))).not.toContain('hunter2hunter2')
   })
 })

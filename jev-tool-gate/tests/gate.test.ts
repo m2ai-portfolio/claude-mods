@@ -25,7 +25,7 @@ const JEV_OK = {
 type Http = { mode: 'ok' | 'error' | 'hang' | 'throw' | 'garbage'; release: (() => void) | null }
 
 // The world beneath the mod: core's verdict, the log sink, the network.
-function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: boolean } = {}) {
+function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: boolean; noProcess?: boolean } = {}) {
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
   mock.store(on, opts.hosted === undefined ? {} : { hosted: opts.hosted })
   mock.env(on, opts.withKey === false ? { HOME: '/home/test' } : { HOME: '/home/test', TYPESAFE_API_KEY: FAKE_KEY })
@@ -41,7 +41,17 @@ function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: bool
   on('tool.check', () => ({ decision: core.decision, reason: 'core says so' }))
 
   const lines: LogLine[] = []
+  // The file API fallback, for a host without $.process.
+  const writes: { path: string; text: string }[] = []
+  on('fs.exists', () => ({ value: false }))
+  on('fs.write', ($, e) => {
+    writes.push({ path: e.path, text: e.text })
+    return { value: undefined }
+  })
   on('process.run', ($, e) => {
+    if (opts.noProcess) {
+      throw new Error('process not offered')
+    }
     const stdin = e.init?.stdin ?? ''
     for (const raw of stdin.split('\n').filter(Boolean)) {
       lines.push(JSON.parse(raw) as LogLine)
@@ -68,7 +78,7 @@ function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: bool
       http.mode === 'garbage' ? '{"model":"x","answers":{},"usage":{"input_tokens":1}}' : JSON.stringify(JEV_OK)
     return { value: { status: 200, ok: true, headers: {}, text } }
   })
-  return { clock, core, lines, requests, http }
+  return { clock, core, lines, requests, http, writes }
 }
 
 // A real call's permission check, as the engine raises it: with tool_use_id.
@@ -210,6 +220,21 @@ describe('hosted switch', () => {
     expect(questions.fetchedRequest?.type).toBe('noul')
   })
 
+  test('the same input under a new operator prompt is asked again', async ($, on) => {
+    const w = world(on, { hosted: true })
+    await start($)
+    await $.prompt.submit({ text: 'just look around', origin: { kind: 'composer' } } as never)
+    await check($, 'Bash', { command: 'rm -rf build' }, 'q1')
+    await $.prompt.submit({ text: 'delete the build folder', origin: { kind: 'composer' } } as never)
+    await check($, 'Bash', { command: 'rm -rf build' }, 'q2')
+    await check($, 'Bash', { command: 'rm -rf build' }, 'q3')
+    expect(w.requests.length).toBe(2)
+    const asked = w.requests.map(r => (JSON.parse(r.body) as { state: { operator_request: string } }).state.operator_request)
+    expect(asked).toEqual(['just look around', 'delete the build folder'])
+    expect(w.lines.map(l => l.cached)).toEqual([false, false, true])
+    expect(w.lines[0]?.inputHash).toBe(w.lines[1]?.inputHash ?? 'missing')
+  })
+
   test('hosted on without a key: no call, error no_api_key', async ($, on) => {
     const w = world(on, { hosted: true, withKey: false })
     await start($)
@@ -292,6 +317,18 @@ describe('privacy', () => {
     expect(log).not.toContain(FAKE_KEY)
   })
 
+  test('a quoted credential survives neither JSON escaping nor nesting', async ($, on) => {
+    const w = world(on, { hosted: true })
+    await start($)
+    await check($, 'Bash', { command: 'API_KEY="hunter2hunter2" curl https://x' }, 'q1')
+    await check($, 'Write', { file_path: '/x/c.json', content: '{"api_key": "hunter2hunter2"}' }, 'q2')
+    expect(w.requests.length).toBe(2)
+    for (const req of w.requests) {
+      expect(req.body).not.toContain('hunter2hunter2')
+    }
+    expect(JSON.stringify(w.lines)).not.toContain('hunter2hunter2')
+  })
+
   test('input sent to Jev is capped at 2,000 chars and the preview at 200', async ($, on) => {
     const w = world(on, { hosted: true })
     await start($)
@@ -308,6 +345,21 @@ describe('privacy', () => {
     await check($, 'Bash', { command: 'rm -rf build' }, 'o1')
     const state = (JSON.parse(w.requests[0]?.body ?? '{}') as { state: { operator_request: string } }).state
     expect(state.operator_request).toBe('tidy the build folder')
+  })
+})
+
+describe('log sink', () => {
+  test('without $.process each session writes its own file, never the shared log', async ($, on) => {
+    const w = world(on, { hosted: false, noProcess: true })
+    await start($)
+    await check($, 'Bash', { command: 'rm one' }, 'f1')
+    await check($, 'Bash', { command: 'rm two' }, 'f2')
+    expect(w.lines.length).toBe(0)
+    expect(w.writes.map(x => x.path)).toEqual([
+      '/home/test/logs/jev-tool-gate.sess-1.jsonl',
+      '/home/test/logs/jev-tool-gate.sess-1.jsonl',
+    ])
+    expect(w.writes.some(x => x.path === '/home/test/logs/jev-tool-gate.jsonl')).toBe(false)
   })
 })
 

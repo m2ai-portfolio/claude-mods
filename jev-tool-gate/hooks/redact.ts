@@ -20,9 +20,11 @@ const RULES: Rule[] = [
   { kind: 'jwt', re: /\beyJ[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]+){0,2}/g },
   { kind: 'bearer', re: /\b(bearer\s+)[A-Za-z0-9._~+/-]{12,}=*/gi, keep: 1 },
   // name=value, name: value, "name": "value". Keeps the name, drops the value.
+  // A quote may carry backslashes (KEY=\"v\" in a shell line or escaped JSON),
+  // or the value would stop at the backslash and stay in clear.
   {
     kind: 'credential',
-    re: /([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|passw(?:or)?d)[A-Za-z0-9_-]*["']?\s*[:=]\s*["']?)[^\s"',;}&]+/gi,
+    re: /([A-Za-z0-9_-]*(?:api[_-]?key|token|secret|passw(?:or)?d)[A-Za-z0-9_-]*\\*["']?\s*[:=]\s*\\*["']?)[^\s"',;}&]+/gi,
     keep: 1,
   },
 ]
@@ -47,6 +49,30 @@ export function redact(text: string): string {
   out = out.replace(HEX_RUN, run => (/[0-9]/.test(run) && /[a-fA-F]/.test(run) ? '[REDACTED:hex]' : run))
   out = out.replace(B64_RUN, run => (looksRandom(run) ? '[REDACTED:base64]' : run))
   return out
+}
+
+// Every string inside a tool input, redacted where it stands. Serializing first
+// would escape its quotes (KEY="v" becomes KEY=\"v\") and hide shapes the rules
+// match, so values are redacted before stableJson, and the result again after.
+export function redactStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return redact(value)
+  }
+  if (Array.isArray(value)) {
+    return value.map(redactStrings)
+  }
+  if (typeof value === 'object' && value !== null) {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactStrings(v)]),
+    )
+  }
+  return value
+}
+
+// A tool input as the text Jev reads and the log keeps: strings redacted in
+// place, then the stable JSON redacted once more for anything in keys.
+export function renderRedacted(input: unknown): string {
+  return redact(stableJson(redactStrings(input)))
 }
 
 // JSON with sorted keys, so { a, b } and { b, a } render and hash alike.

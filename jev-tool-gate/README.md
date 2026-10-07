@@ -19,10 +19,12 @@ model) thinks of it. It never changes a decision. Rung 1 of the trust ladder.
   from the operator's request.
 - Hosted switch, persisted in the mod's store, DEFAULT OFF. Off: the candidate
   is logged with `judged: false` and no network call is made. On: one request
-  per distinct (question version, tool, redacted input), raced against 800 ms;
+  per distinct (question version, tool, redacted input, operator prompt),
+  raced against 800 ms;
   timeout or any error is logged and the call goes on (fail open). Successful
   judgments are cached for the session; errors are not cached.
-- What is sent: tool name, the input as sorted JSON after secret redaction,
+- What is sent: tool name, the input as sorted JSON after secret redaction
+  (each string value is redacted before serializing, then the JSON again),
   capped at 2,000 chars, plus the operator's last prompt (redacted, first 300
   chars). Subagent calls are logged with their `agentId`.
 
@@ -45,7 +47,9 @@ the one `TYPESAFE_API_KEY=` line of `~/.env.shared`. Never logged or shown.
   (`ts, sessionId, agentId, tool, toolUseId, inputHash, preview (200 chars,
   redacted), questionVersion, judged, cached, scores, lowConfidence, model,
   inputTokens, latencyMs, error, coreDecision, coreRule`). Rotates to `.1`
-  past 5 MiB.
+  past 5 MiB. Where `$.process` is unavailable (not the CLI) there is no atomic
+  append, so lines go to `~/logs/jev-tool-gate.<session>.jsonl` instead, one
+  file per session, so sessions never overwrite each other's lines.
 - Kill: `/jev-gate hosted off` stops all network calls; removing this folder
   from `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json` stops the mod.
 
