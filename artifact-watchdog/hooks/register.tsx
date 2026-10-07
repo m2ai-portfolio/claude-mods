@@ -610,14 +610,21 @@ async function stop($: EngineInterface, w: Watch): Promise<void> {
   })
 
   // consent marks this call as the person's own request on the permission path.
-  const ran = await $.tool.call({
-    tool: 'TaskStop',
-    task_id: agentId,
-    consent: `Matthew pressed "Stop" on stalled subagent "${w.label}" (${agentId}) in the artifact-watchdog pane.`,
-  })
+  // A call that rejects (no TaskStop, aborted) takes the failure branch too:
+  // left uncaught it would strand the row in stopping and escape the press.
+  let failure: string | null
+  try {
+    const ran = await $.tool.call({
+      tool: 'TaskStop',
+      task_id: agentId,
+      consent: `Matthew pressed "Stop" on stalled subagent "${w.label}" (${agentId}) in the artifact-watchdog pane.`,
+    })
+    failure = ran.deny !== undefined ? `denied: ${ran.deny}` : ran.isError ? `failed: ${ran.text ?? 'error'}` : null
+  } catch (err) {
+    failure = `threw: ${err instanceof Error ? err.message : String(err)}`
+  }
   isSettled = true
   waitTimer.cancel()
-  const failure = ran.deny !== undefined ? `denied: ${ran.deny}` : ran.isError ? `failed: ${ran.text ?? 'error'}` : null
   if (failure !== null) {
     // The agent may still be running: back to stalled, so the poll keeps
     // watching it and the Stop button is there to press again.

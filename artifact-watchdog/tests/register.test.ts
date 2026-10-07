@@ -53,7 +53,7 @@ function world(on: On, file: { size: number; text: string; mtimeMs?: number }, i
   })
   const stops: { task_id: unknown; consent: unknown }[] = []
   // TaskStop answers at once unless a test holds it, as a permission ask does live.
-  const gate: { hold: Promise<void> | null; answer: 'ok' | 'deny' | 'error' } = { hold: null, answer: 'ok' }
+  const gate: { hold: Promise<void> | null; answer: 'ok' | 'deny' | 'error' | 'throw' } = { hold: null, answer: 'ok' }
   on('tool.call', { tool: 'TaskStop' }, async ($, e) => {
     stops.push({ task_id: (e as { task_id?: unknown }).task_id, consent: (e as { consent?: unknown }).consent })
     if (gate.hold) {
@@ -64,6 +64,9 @@ function world(on: On, file: { size: number; text: string; mtimeMs?: number }, i
     }
     if (gate.answer === 'error') {
       return { isError: true as const, result: null, text: 'no such task' }
+    }
+    if (gate.answer === 'throw') {
+      throw new Error('TaskStop aborted')
     }
     return { result: { message: 'stopped' } }
   })
@@ -445,6 +448,30 @@ describe('failed Stop', () => {
       expect(w.statuses.at(-1)).toBeUndefined()
     })
   }
+
+  test('a TaskStop call that rejects goes back to stalled with Stop restored, and nothing escapes the press', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    w.gate.answer = 'throw'
+    await dispatchAndStall($, w, file)
+    const ui = await $.ui.mount({
+      plugin: 'artifact-watchdog',
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: 'artifact-watchdog',
+      props: PANE_PROPS,
+    })
+    // The press resolves: the rejection is handled inside stop(), not left to the pane.
+    await ui.press({ key: 'stop-tw' })
+    expect(w.stops.length).toBe(1)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(JSON.stringify(await ui.findAll({}))).toContain('Stop threw')
+    expect(w.toasts.some(t => t.includes('did not go through'))).toBe(true)
+    expect(await ui.find({ key: 'stop-tw' })).toBeDefined()
+    // The wait timer was cancelled with the call: no "unanswered" line later.
+    await w.clock.advance(30_000)
+    expect(JSON.stringify(await ui.findAll({}))).not.toContain('unanswered')
+  })
 })
 
 describe('wake on stall', () => {
