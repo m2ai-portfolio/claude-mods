@@ -1,6 +1,6 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { AgentStatus, On } from 'claude-code'
 
 tier('user')
 
@@ -42,7 +42,7 @@ function world(on: On, file: { size: number; text: string; mtimeMs?: number }, i
       : { status: 'async_launched', agentId: 'agent-7', description: 'probe' },
   }))
   // The engine's view of agent-7; a test flips it to model the hand-back.
-  const agent = { status: 'running' }
+  const agent: { status: AgentStatus } = { status: 'running' }
   on('agent.list', () => ({
     value: [{ id: 'agent-7', description: 'probe', type: 'general-purpose', status: agent.status }],
   }))
@@ -626,9 +626,12 @@ describe('wake on stall', () => {
   }
 })
 
-// One tool call in agent-7's own loop, run to its end.
+// One tool call in agent-7's own loop, run to its end. ToolCallArgs omits
+// agentId (the engine drops it from a hook's call), but the test harness passes
+// it through; a non-literal input skips the excess-property check.
 async function agentCall($: Parameters<TestBody>[0], n: number) {
-  await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: `b${n}`, agentId: 'agent-7' })
+  const input = { tool: 'Bash' as const, command: 'npm test', tool_use_id: `b${n}`, agentId: 'agent-7' }
+  await $.tool.call(input)
 }
 
 // Holds the world's next agent call open until the returned release runs.
@@ -769,7 +772,8 @@ describe('agent activity', () => {
     await $.tool.call({ tool: 'Agent', tool_use_id: 'to', description: 'probe', prompt: PROMPT })
     for (let n = 0; n < 6; n++) {
       await w.clock.advance(60_000)
-      await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: `o${n}`, agentId: 'agent-other' })
+      const input = { tool: 'Bash' as const, command: 'ls', tool_use_id: `o${n}`, agentId: 'agent-other' }
+      await $.tool.call(input)
     }
     await w.clock.advance(15_000)
     expect(w.toasts.length).toBe(1)
