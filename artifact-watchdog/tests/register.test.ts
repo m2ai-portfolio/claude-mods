@@ -1,6 +1,6 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
-import type { On } from 'claude-code'
+import type { AgentStatus, On } from 'claude-code'
 
 tier('user')
 
@@ -16,14 +16,14 @@ const PANE_PROPS = {
 const PROMPT = `Do the thing.\nOUTPUT CONTRACT: write to ${ARTIFACT}\nSCOPE: read-only.`
 
 // The world beneath the mod: a file whose size and text the test sets.
-function world(on: On, file: { size: number; text: string }, isForeground = false) {
+function world(on: On, file: { size: number; text: string; mtimeMs?: number }, isForeground = false) {
   const toasts: string[] = []
   const statuses: (string | undefined)[] = []
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/home/apexaipc' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
-  on('fs.stat', () => ({ value: { kind: 'file', size: file.size, mtimeMs: 0, isLink: false } }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: file.size, mtimeMs: file.mtimeMs ?? 0, isLink: false } }))
   on('fs.read', () => ({ value: file.text }))
   on('ui.toast', ($, e) => {
     toasts.push(e.text)
@@ -42,7 +42,7 @@ function world(on: On, file: { size: number; text: string }, isForeground = fals
       : { status: 'async_launched', agentId: 'agent-7', description: 'probe' },
   }))
   // The engine's view of agent-7; a test flips it to model the hand-back.
-  const agent = { status: 'running' }
+  const agent: { status: AgentStatus } = { status: 'running' }
   on('agent.list', () => ({
     value: [{ id: 'agent-7', description: 'probe', type: 'general-purpose', status: agent.status }],
   }))
@@ -53,11 +53,20 @@ function world(on: On, file: { size: number; text: string }, isForeground = fals
   })
   const stops: { task_id: unknown; consent: unknown }[] = []
   // TaskStop answers at once unless a test holds it, as a permission ask does live.
-  const gate: { hold: Promise<void> | null } = { hold: null }
+  const gate: { hold: Promise<void> | null; answer: 'ok' | 'deny' | 'error' | 'throw' } = { hold: null, answer: 'ok' }
   on('tool.call', { tool: 'TaskStop' }, async ($, e) => {
     stops.push({ task_id: (e as { task_id?: unknown }).task_id, consent: (e as { consent?: unknown }).consent })
     if (gate.hold) {
       await gate.hold
+    }
+    if (gate.answer === 'deny') {
+      return { deny: 'permission denied' }
+    }
+    if (gate.answer === 'error') {
+      return { isError: true as const, result: null, text: 'no such task' }
+    }
+    if (gate.answer === 'throw') {
+      throw new Error('TaskStop aborted')
     }
     return { result: { message: 'stopped' } }
   })
@@ -102,6 +111,18 @@ async function paneText($: Parameters<TestBody>[0]): Promise<string> {
     props: PANE_PROPS,
   })
   return JSON.stringify(await ui.findAll({}))
+}
+
+// One mounted pane, read as text as often as a test needs.
+async function paneReader($: Parameters<TestBody>[0]): Promise<() => Promise<string>> {
+  const ui = await $.ui.mount({
+    plugin: 'artifact-watchdog',
+    surface: 'desktop',
+    component: 'Pane',
+    requestId: 'artifact-watchdog',
+    props: PANE_PROPS,
+  })
+  return async () => JSON.stringify(await ui.findAll({}))
 }
 
 // /watchdog as typed at the prompt: the engine stamps origin and presentation.
@@ -343,7 +364,134 @@ describe('register', () => {
   })
 })
 
+describe('reused artifact path', () => {
+  test("an earlier run's AGENT COMPLETE does not close a new dispatch's watch", async ($, on) => {
+    const file = { size: 90, text: '# Old report\nAGENT COMPLETE: old run\n', mtimeMs: 100 }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tr', description: 'probe', prompt: PROMPT })
+    const pane = await paneReader($)
+    await w.clock.advance(15_000)
+    await w.clock.advance(15_000)
+    expect(await pane()).toContain('waiting')
+    expect(await pane()).not.toContain('complete')
+
+    // The new run overwrites the file (shorter), then finishes with its own marker.
+    file.size = 20
+    file.text = '# New report\n'
+    file.mtimeMs = 200
+    await w.clock.advance(15_000)
+    expect(await pane()).toContain('growing')
+    file.size = 60
+    file.text = '# New report\nAGENT COMPLETE: new run\n'
+    file.mtimeMs = 300
+    await w.clock.advance(15_000)
+    expect(await pane()).toContain('new run')
+  })
+
+  test('a same-size rewrite with a newer mtime counts as a write', async ($, on) => {
+    const file = { size: 90, text: '# Old report\nAGENT COMPLETE: old run\n', mtimeMs: 100 }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'ts', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(15_000)
+    file.text = '# New report, padded to the same length..\nAGENT COMPLETE: same\n'
+    file.mtimeMs = 500
+    await w.clock.advance(15_000)
+    expect(await paneText($)).toContain('same')
+  })
+
+  test('an unchanged old file stalls the new watch instead of completing it', async ($, on) => {
+    const file = { size: 90, text: '# Old report\nAGENT COMPLETE: old run\n', mtimeMs: 100 }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tu', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(w.toasts.length).toBe(1)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+  })
+})
+
+describe('failed Stop', () => {
+  for (const answer of ['deny', 'error'] as const) {
+    test(`a TaskStop that comes back ${answer} keeps the row stalled, watched and stoppable`, async ($, on) => {
+      const file = { size: 0, text: '' }
+      const w = world(on, file)
+      w.gate.answer = answer
+      await dispatchAndStall($, w, file)
+      const ui = await $.ui.mount({
+        plugin: 'artifact-watchdog',
+        surface: 'desktop',
+        component: 'Pane',
+        requestId: 'artifact-watchdog',
+        props: PANE_PROPS,
+      })
+      await ui.press({ key: 'stop-tw' })
+      expect(w.stops.length).toBe(1)
+      expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+      expect(JSON.stringify(await ui.findAll({}))).toContain(answer === 'deny' ? 'Stop denied' : 'Stop failed')
+      expect(w.toasts.some(t => t.includes('did not go through'))).toBe(true)
+      expect(await ui.find({ key: 'stop-tw' })).toBeDefined()
+
+      // Still polled: growth clears the stall.
+      file.size = 120
+      file.text = '# Report\nmore\n'
+      await w.clock.advance(15_000)
+      expect(JSON.stringify(await ui.findAll({}))).toContain('growing')
+
+      // And a later Stop that works marks it stopped.
+      w.gate.answer = 'ok'
+      await w.clock.advance(5 * 60_000 + 15_000)
+      await ui.press({ key: 'stop-tw' })
+      expect(w.stops.length).toBe(2)
+      expect(JSON.stringify(await ui.findAll({}))).toContain('stopped from the pane')
+      expect(w.statuses.at(-1)).toBeUndefined()
+    })
+  }
+
+  test('a TaskStop call that rejects goes back to stalled with Stop restored, and nothing escapes the press', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    w.gate.answer = 'throw'
+    await dispatchAndStall($, w, file)
+    const ui = await $.ui.mount({
+      plugin: 'artifact-watchdog',
+      surface: 'desktop',
+      component: 'Pane',
+      requestId: 'artifact-watchdog',
+      props: PANE_PROPS,
+    })
+    // The press resolves: the rejection is handled inside stop(), not left to the pane.
+    await ui.press({ key: 'stop-tw' })
+    expect(w.stops.length).toBe(1)
+    expect(w.statuses.at(-1)).toBe('artifacts: 1 STALLED')
+    expect(JSON.stringify(await ui.findAll({}))).toContain('Stop threw')
+    expect(w.toasts.some(t => t.includes('did not go through'))).toBe(true)
+    expect(await ui.find({ key: 'stop-tw' })).toBeDefined()
+    // The wait timer was cancelled with the call: no "unanswered" line later.
+    await w.clock.advance(30_000)
+    expect(JSON.stringify(await ui.findAll({}))).not.toContain('unanswered')
+  })
+})
+
 describe('wake on stall', () => {
+  test('/watchdog wake off during a turn cancels a wake already pending', async ($, on) => {
+    const file = { size: 0, text: '' }
+    const w = world(on, file)
+    await $.session.start({ surface: 'desktop', isInteractive: true, cwd: '/work' })
+    const pane = await paneReader($)
+    await $.turn.start({ text: 'work', turnId: 'turn-1' })
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'tw', description: 'probe', prompt: PROMPT })
+    await w.clock.advance(5 * 60_000 + 15_000)
+    expect(await pane()).toContain('wake pending until the turn ends')
+
+    await watchdog($, 'wake off')
+    expect(await pane()).not.toContain('wake pending')
+    await $.turn.complete({ answer: 'done', durationMs: 1, isAborted: false, reason: 'answer', turnId: 'turn-1' })
+    await w.clock.advance(5 * 60_000)
+    expect(w.submits).toEqual([])
+  })
+
   test('a stall with the main loop idle submits one wake naming the agent', async ($, on) => {
     const file = { size: 0, text: '' }
     const w = world(on, file)
@@ -505,9 +653,12 @@ describe('wake on stall', () => {
   }
 })
 
-// One tool call in agent-7's own loop, run to its end.
+// One tool call in agent-7's own loop, run to its end. ToolCallArgs omits
+// agentId (the engine drops it from a hook's call), but the test harness passes
+// it through; a non-literal input skips the excess-property check.
 async function agentCall($: Parameters<TestBody>[0], n: number) {
-  await $.tool.call({ tool: 'Bash', command: 'npm test', tool_use_id: `b${n}`, agentId: 'agent-7' })
+  const input = { tool: 'Bash' as const, command: 'npm test', tool_use_id: `b${n}`, agentId: 'agent-7' }
+  await $.tool.call(input)
 }
 
 // Holds the world's next agent call open until the returned release runs.
@@ -648,7 +799,8 @@ describe('agent activity', () => {
     await $.tool.call({ tool: 'Agent', tool_use_id: 'to', description: 'probe', prompt: PROMPT })
     for (let n = 0; n < 6; n++) {
       await w.clock.advance(60_000)
-      await $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: `o${n}`, agentId: 'agent-other' })
+      const input = { tool: 'Bash' as const, command: 'ls', tool_use_id: `o${n}`, agentId: 'agent-other' }
+      await $.tool.call(input)
     }
     await w.clock.advance(15_000)
     expect(w.toasts.length).toBe(1)

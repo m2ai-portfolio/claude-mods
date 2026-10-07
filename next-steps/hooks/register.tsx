@@ -158,8 +158,11 @@ export const register: Register = (on, options) => {
   })
 
   // Turn over: ask the fork, detached, so the turn's completion never waits on it.
+  // A subagent's run ends with a turn.complete too (it carries agentId): that is
+  // not the person's turn, so it neither forks nor replaces the suggestions.
   on('turn.complete', async ($, e, next) => {
     const result = await next(e)
+    if (e.agentId !== undefined) return result
     if (e.reason !== 'answer' || e.answer.trim().length < minTurnChars) return result
     const turnId = e.turnId
     show($, { kind: 'loading', turnId })
