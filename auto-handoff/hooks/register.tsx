@@ -5,7 +5,8 @@
 // dropping back below (a /clear, a compaction) re-arms it.
 // The handoff: $.model.fork drafts it from the session's own transcript (a
 // cached, tool-less question), in the exact /next format; handoff.mjs saves
-// it, moves LATEST and appends DECISIONS.md, as /next's Step 4 does.
+// it, moves LATEST and appends DECISIONS.md, as /next's Step 4 does, and
+// stamps the Transcript-Cutoff read just before the fork (/prime's tail check).
 // ui.render (AbovePrompt): what happened and the pickup line (/clear, /prime);
 // once saved, a button runs both. On the desktop a "Retire this session"
 // toggle turns that button into "Retire session": rename this session to
@@ -370,20 +371,25 @@ async function writeHandoff($: EngineInterface, tokens: number, isThreshold: boo
     }
 
     // /next Step 3: the draft, from the session's own context.
-    const reply = await $.model.fork({
-      prompt: forkPrompt({
-        now: (await exec($, ['date', '+%Y-%m-%d %H:%M %Z'])).out,
-        cwd,
-        project: resolved.ok ? resolved.out : null,
-        projects,
-        sessionId,
-        model: await $.session.model(),
-        tokens,
-        key,
-        git,
-        previous,
-      }),
+    const prompt = forkPrompt({
+      now: (await exec($, ['date', '+%Y-%m-%d %H:%M %Z'])).out,
+      cwd,
+      project: resolved.ok ? resolved.out : null,
+      projects,
+      sessionId,
+      model: await $.session.model(),
+      tokens,
+      key,
+      git,
+      previous,
     })
+    // The Transcript-Cutoff: the last transcript entry the fork replays, read just
+    // before it starts. The session keeps talking while the fork drafts (2026-10-07:
+    // a decision 16 s later never reached the handoff); /prime's tail check reads
+    // everything after this entry. Unreadable: "none", and /prime falls back to Date.
+    const cut = await exec($, ['node', script, 'cutoff', '--session', sessionId, '--cwd', cwd, '--fork'], cwd)
+    const cutoff = cut.ok && cut.out ? cut.out : 'none'
+    const reply = await $.model.fork({ prompt })
     if (!reply.isAnswered) {
       await fail(`the fork returned no draft (${reply.reason})`)
       return
@@ -400,6 +406,7 @@ async function writeHandoff($: EngineInterface, tokens: number, isThreshold: boo
     await $.fs.write(draft, parsed.markdown)
     const saved = await exec($, [
       'node', script, 'save', '--slug', parsed.slug, '--file', draft, '--project', project, '--key', key,
+      '--cutoff', cutoff,
     ], cwd)
     if (!saved.ok) {
       await fail(`handoff.mjs refused the draft: ${saved.out.slice(0, 160)}`, project)

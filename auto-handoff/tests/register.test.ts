@@ -46,7 +46,11 @@ type World = {
   forkText: string
   // The desktop app's answer to archive_session; absent, it archives.
   archiveError?: string
+  // What `handoff.mjs cutoff` prints; null, it fails (no transcript). Absent, CUTOFF.
+  cutoff?: string | null
 }
+
+const CUTOFF = '5d6fe2e0-4e96-4002-b681-c1aec6d962a7 2026-10-04T15:00:01.903Z'
 
 function world(on: On, w: World) {
   const saves: string[][] = []
@@ -61,6 +65,9 @@ function world(on: On, w: World) {
   // Desktop session tools the mod called, as "tool title-or-session".
   const sessions: string[] = []
   const copies: string[] = []
+  // The cutoff read and the fork, in the order they happened.
+  const order: string[] = []
+  const cutoffs: string[][] = []
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/home/apexaipc' })
   on('session.start', ($, e) => ({ cwd: e.cwd }))
@@ -74,6 +81,7 @@ function world(on: On, w: World) {
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('model.fork', async ($, e) => {
     prompts.push(e.prompt)
+    order.push('fork')
     if (gate.hold) {
       await gate.hold
     }
@@ -117,13 +125,19 @@ function world(on: On, w: World) {
     if (sub === 'project') return w.cwd === '/home/apexaipc' ? bad('handoff: working directory is the home folder') : ok('my-proj\n')
     if (sub === 'list') return ok('aiva\t2026-09-08-2354-aiva-tiger-team.md\npicked-proj\t2026-10-01-0000-x.md\n')
     if (sub === 'latest') return bad('no handoffs')
+    if (sub === 'cutoff') {
+      order.push('cutoff')
+      cutoffs.push([...e.argv])
+      const c = w.cutoff === undefined ? CUTOFF : w.cutoff
+      return c === null ? bad('handoff: no transcript for session abcdef1234567890') : ok(`${c}\n`)
+    }
     if (sub === 'save') {
       saves.push([...e.argv])
       return ok(`${SAVED}\n`)
     }
     return bad(`unexpected ${e.argv.join(' ')}`)
   })
-  return { clock, saves, writes, prompts, toasts, commands, gate, ran, sessions, copies }
+  return { clock, saves, writes, prompts, toasts, commands, gate, ran, sessions, copies, order, cutoffs }
 }
 
 async function turn($: Parameters<TestBody>[0], agentId?: string) {
@@ -167,6 +181,34 @@ describe('register', () => {
     await t.clock.advance(5)
     expect(t.saves.length).toBe(2)
     expect(arg(t.saves[1]!, '--key')).toBe('auto-abcdef12-2')
+  })
+
+  test('the Transcript-Cutoff is read before the fork starts and stamped by save', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    // Read first: what the session says while the fork drafts lands after it, in the tail.
+    expect(t.order).toEqual(['cutoff', 'fork'])
+    expect(t.cutoffs[0]).toEqual([
+      'node', '/home/apexaipc/.claude/skills/next/scripts/handoff.mjs', 'cutoff',
+      '--session', 'abcdef1234567890', '--cwd', '/work/my-proj', '--fork',
+    ])
+    expect(arg(t.saves[0]!, '--cutoff')).toBe(CUTOFF)
+    // The fork is never asked for the stamp, so it cannot get it wrong.
+    expect(t.prompts[0]).not.toContain('Transcript-Cutoff')
+  })
+
+  test('an unreadable transcript still saves, stamped none so /prime falls back to Date', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT, cutoff: null }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+    expect(arg(t.saves[0]!, '--cutoff')).toBe('none')
+    expect(t.toasts.at(-1)).toContain('Handoff saved')
   })
 
   test('a window other than 1M never fires, nor does a subagent turn', async ($, on) => {
