@@ -2,6 +2,7 @@ import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { TestBody } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { FALLBACK_ROTATE_CHARS } from '../hooks/register'
 import type { LogLine } from '../hooks/register'
 
 tier('user')
@@ -33,9 +34,14 @@ function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: bool
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('session.id', () => ({ value: 'sess-1' }))
   on('prompt.submit', ($, e) => ({ text: e.text }))
-  // No ~/.env.shared in the test world.
-  on('fs.read', () => {
-    throw new Error('ENOENT')
+  // The files the mod wrote, by path. No ~/.env.shared in the test world.
+  const files = new Map<string, string>()
+  on('fs.read', ($, e) => {
+    const text = files.get(e.path)
+    if (text === undefined) {
+      throw new Error('ENOENT')
+    }
+    return { value: text }
   })
   const core = { decision: (opts.core ?? 'ask') as Decision }
   on('tool.check', () => ({ decision: core.decision, reason: 'core says so' }))
@@ -43,9 +49,10 @@ function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: bool
   const lines: LogLine[] = []
   // The file API fallback, for a host without $.process.
   const writes: { path: string; text: string }[] = []
-  on('fs.exists', () => ({ value: false }))
+  on('fs.exists', ($, e) => ({ value: files.has(e.path) }))
   on('fs.write', ($, e) => {
     writes.push({ path: e.path, text: e.text })
+    files.set(e.path, e.text)
     return { value: undefined }
   })
   on('process.run', ($, e) => {
@@ -78,7 +85,7 @@ function world(on: On, opts: { hosted?: boolean; core?: Decision; withKey?: bool
       http.mode === 'garbage' ? '{"model":"x","answers":{},"usage":{"input_tokens":1}}' : JSON.stringify(JEV_OK)
     return { value: { status: 200, ok: true, headers: {}, text } }
   })
-  return { clock, core, lines, requests, http, writes }
+  return { clock, core, lines, requests, http, writes, files }
 }
 
 // A real call's permission check, as the engine raises it: with tool_use_id.
@@ -360,6 +367,30 @@ describe('log sink', () => {
       '/home/test/logs/jev-tool-gate.sess-1.jsonl',
     ])
     expect(w.writes.some(x => x.path === '/home/test/logs/jev-tool-gate.jsonl')).toBe(false)
+    // The second append keeps the first line.
+    const kept = (w.files.get('/home/test/logs/jev-tool-gate.sess-1.jsonl') ?? '').split('\n').filter(Boolean)
+    expect(kept.map(l => (JSON.parse(l) as LogLine).toolUseId)).toEqual(['f1', 'f2'])
+  })
+
+  test('the per-session file rotates to .1 past the cap, so it stays bounded and keeps the newest line', async ($, on) => {
+    const w = world(on, { hosted: false, noProcess: true })
+    const own = '/home/test/logs/jev-tool-gate.sess-1.jsonl'
+    // An earlier run filled it just past the cap.
+    const old = `${'{"old":"x"}\n'.repeat(Math.ceil(FALLBACK_ROTATE_CHARS / 12) + 1)}`
+    expect(old.length).toBeGreaterThan(FALLBACK_ROTATE_CHARS)
+    w.files.set(own, old)
+    await start($)
+    await check($, 'Bash', { command: 'rm newest' }, 'n1')
+    const now = w.files.get(own) ?? ''
+    expect(now.length).toBeLessThanOrEqual(FALLBACK_ROTATE_CHARS)
+    const kept = now.split('\n').filter(Boolean)
+    expect(kept.length).toBe(1)
+    expect((JSON.parse(kept[0] ?? '{}') as LogLine).toolUseId).toBe('n1')
+    expect(w.files.get(`${own}.1`)).toBe(old)
+    // The next line appends to the fresh file.
+    await check($, 'Bash', { command: 'rm after' }, 'n2')
+    const next = (w.files.get(own) ?? '').split('\n').filter(Boolean)
+    expect(next.map(l => (JSON.parse(l) as LogLine).toolUseId)).toEqual(['n1', 'n2'])
   })
 })
 

@@ -57,6 +57,9 @@ const CACHE_MAX = 500
 const RECENT_MAX = 5
 // Rotate the log to .1 past this size (checked by the append itself).
 const ROTATE_BYTES = 5 * 1024 * 1024
+// The fallback file rotates the same way, at a lower size: with no append in
+// the file API every line rewrites the whole file, so its size is the cost.
+export const FALLBACK_ROTATE_CHARS = 1024 * 1024
 const DEFAULT_TOOLS = 'Bash,Write,Edit,NotebookEdit'
 const DEFAULT_MCP_VERBS = 'send,delete,post,publish,trash,transfer'
 // Prompts typed or sent by the operator; notifications, peers and plugins are
@@ -203,7 +206,8 @@ async function askJev($: EngineInterface, key: string, request: JevRequest): Pro
 // write at once. Where $.process is not offered (not the CLI) there is no
 // atomic append, and a read-and-rewrite of the shared log lets two sessions
 // overwrite each other's line. So the fallback rewrites this session's own
-// file (jev-tool-gate.<session>.jsonl), which only this session's sink touches.
+// file (jev-tool-gate.<session>.jsonl), which only this session's sink touches,
+// and rotates it to .1 past FALLBACK_ROTATE_CHARS, as the shell path does.
 async function append($: EngineInterface, line: string): Promise<void> {
   const path = await logPath($)
   const script =
@@ -221,6 +225,11 @@ async function append($: EngineInterface, line: string): Promise<void> {
   const own = sessionLogPath(path)
   const exists = await $.fs.exists(own)
   const before = exists ? await $.fs.read(own) : ''
+  if (before.length > FALLBACK_ROTATE_CHARS) {
+    await $.fs.write(`${own}.1`, before)
+    await $.fs.write(own, `${line}\n`)
+    return
+  }
   await $.fs.write(own, `${before}${line}\n`)
 }
 
