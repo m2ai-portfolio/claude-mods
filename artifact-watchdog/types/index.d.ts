@@ -3,7 +3,8 @@
 // recent tool call or model request, or one still in flight): no alarm.
 // stalled: no growth for the stall window AND the agent silent for the silence
 // window (or no agent id to watch). complete: last line is AGENT COMPLETE.
-// stopping: Stop pressed, TaskStop not answered yet. stopped: TaskStop answered.
+// stopping: Stop pressed, TaskStop not answered yet. stopped: TaskStop stopped it
+// (a denied or failed TaskStop puts the row back to stalled).
 // ended: the agent finished (or was stopped elsewhere) without writing AGENT COMPLETE.
 // missing: the prompt named no artifact path.
 export type WatchStatus =
@@ -24,6 +25,9 @@ export type Watch = {
   agentId: string | null
   startedAt: number
   lastSize: number
+  // The file's mtime at the last reading (at dispatch first), or null when
+  // there was no file: with lastSize, what a write by this dispatch changes.
+  lastMtimeMs?: number | null
   lastGrowthAt: number
   status: WatchStatus
   summary: string

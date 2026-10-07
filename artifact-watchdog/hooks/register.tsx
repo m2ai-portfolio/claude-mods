@@ -4,8 +4,11 @@
 // tool.call (Agent): pull the artifact path out of the dispatch prompt and
 // start a watch; keep the async agentId so the pane can TaskStop it.
 // session.start: register /watchdog and start the poll timer.
-// Every TICK_MS: stat each live artifact. Growth resets the clock, a last line
-// of "AGENT COMPLETE" closes the watch. STALL_MS without growth is only half
+// Every TICK_MS: stat each live artifact. A write since dispatch resets the
+// clock, and a last line of "AGENT COMPLETE" closes the watch. The file is
+// stat'ed at dispatch first: a reused path (re-dispatching the same task
+// overwrites the same slug) may already end with an earlier run's marker, and
+// only a write by this dispatch may close its watch. STALL_MS without growth is only half
 // a stall: the agent may be alive and busy (a long test run) without
 // appending. So the agent's own activity is tracked too, from the events that
 // carry its agentId: tool.call (start, and its end when next resolves),
@@ -116,6 +119,9 @@ export const register: Register = on => {
     const words = (e.args ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean)
     if (words[0] === 'wake' && (words[1] === 'on' || words[1] === 'off') && words.length === 2) {
       await update($, wakeOn, () => words[1] === 'on')
+      if (words[1] === 'off') {
+        await cancelPendingWakes($)
+      }
       return { text: `Artifact watchdog: wake on stall is ${words[1]}.` }
     }
     if (words[0] === 'wake' && words.length === 1) {
@@ -152,13 +158,18 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
     const now = await $.clock.now()
     const match = ARTIFACT_RE.exec(String(e.prompt ?? ''))
+    const path = match ? match[0].replace(/^~/, home) : null
+    // What is at the path before the agent starts: the baseline a write must change.
+    const before = path === null ? undefined : await $.fs.stat(path).catch(() => undefined)
+    const isFile = before?.kind === 'file'
     const watch: Watch = {
       id: e.tool_use_id ?? `agent-${now}`,
       label: String(e.description ?? 'agent'),
-      path: match ? match[0].replace(/^~/, home) : null,
+      path,
       agentId: null,
       startedAt: now,
-      lastSize: 0,
+      lastSize: isFile ? before.size : 0,
+      lastMtimeMs: isFile ? before.mtimeMs : null,
       lastGrowthAt: now,
       status: match ? 'waiting' : 'missing',
       summary: match ? '' : 'prompt names no artifact path',
@@ -271,7 +282,8 @@ function detail(w: Watch, now: number): string {
   const file = w.path ? w.path.split('/').pop() : ''
   const quiet = w.status === 'quiet' ? ' · quiet file, agent active' : ''
   const woke = w.status === 'stalled' && w.wake ? ` · ${w.wake.detail}` : ''
-  return `${file} · ${kb(w.lastSize)} · idle ${idle}s${agentDetail(w, now)}${quiet}${woke}`
+  const note = w.summary ? ` · ${w.summary}` : ''
+  return `${file} · ${kb(w.lastSize)} · idle ${idle}s${agentDetail(w, now)}${quiet}${woke}${note}`
 }
 
 // The agent half of a live row: what is running now, else its last event.
@@ -398,15 +410,22 @@ async function tick($: EngineInterface): Promise<void> {
       const path = w.path ?? ''
       const stat = await $.fs.stat(path).catch(() => undefined)
       const size = stat?.kind === 'file' ? stat.size : 0
-      if (size > w.lastSize) {
+      const mtimeMs = stat?.kind === 'file' ? stat.mtimeMs : null
+      // Written since the last reading: longer, or rewritten (shorter, or the
+      // same size with a newer mtime). An unchanged file left by an earlier
+      // dispatch never counts, so its old marker cannot close this watch.
+      const lastMtimeMs = w.lastMtimeMs ?? null
+      const isNewer = mtimeMs !== null && lastMtimeMs !== null && mtimeMs > lastMtimeMs
+      const isWritten = size > 0 && (size !== w.lastSize || isNewer)
+      if (isWritten) {
         const text: string = await $.fs.read(path).catch(() => '')
         const lastLine = text.trimEnd().split('\n').pop() ?? ''
         const marker = MARKER_RE.exec(lastLine.trim())
         put(
           w.id,
           marker
-            ? { status: 'complete', lastSize: size, lastGrowthAt: now, summary: marker[1] ?? '' }
-            : { status: 'growing', lastSize: size, lastGrowthAt: now },
+            ? { status: 'complete', lastSize: size, lastMtimeMs: mtimeMs, lastGrowthAt: now, summary: marker[1] ?? '' }
+            : { status: 'growing', lastSize: size, lastMtimeMs: mtimeMs, lastGrowthAt: now, summary: '' },
         )
       }
       const seen = activityOf(w)
@@ -503,6 +522,12 @@ async function decideWakes($: EngineInterface): Promise<void> {
   if (pending.length === 0) {
     return
   }
+  // A wake goes pending while a turn runs; /watchdog wake off before that turn
+  // ends must still hold it back.
+  if (!(await isWakeOn($))) {
+    await cancelPendingWakes($)
+    return
+  }
   const agents = pending.some(w => w.agentId !== null) ? await $.agent.list().catch(() => undefined) : undefined
   const running = new Set((agents ?? []).filter(a => a.status === 'running').map(a => a.id))
   const ready = new Set(pending.filter(w => w.agentId === null || running.has(w.agentId)).map(w => w.id))
@@ -534,6 +559,12 @@ async function decideWakes($: EngineInterface): Promise<void> {
       )
       .catch(() => undefined)
   }
+}
+
+// Wake off: every wake still pending becomes "off". One already queued has
+// gone to the engine and is left to settle.
+async function cancelPendingWakes($: EngineInterface): Promise<void> {
+  await update($, watches, list => list.map(w => (w.wake?.state === 'pending' ? { ...w, wake: OFF } : w)))
 }
 
 function failedWake(reason: string): Wake {
@@ -586,7 +617,26 @@ async function stop($: EngineInterface, w: Watch): Promise<void> {
   })
   isSettled = true
   waitTimer.cancel()
-  const summary = ran.deny ?? (ran.isError ? `TaskStop failed: ${ran.text ?? ''}` : 'stopped from the pane')
+  const failure = ran.deny !== undefined ? `denied: ${ran.deny}` : ran.isError ? `failed: ${ran.text ?? 'error'}` : null
+  if (failure !== null) {
+    // The agent may still be running: back to stalled, so the poll keeps
+    // watching it and the Stop button is there to press again.
+    const summary = `Stop ${failure}`
+    await update($, watches, list =>
+      list.map(one => (one.id === w.id && one.status === 'stopping' ? { ...one, status: 'stalled' as const, summary } : one)),
+    )
+    showStatus($, await currentWatches($))
+    $.ui.toast(`Stop on "${w.label}" did not go through (TaskStop ${failure}). Press Stop again or stop it yourself.`, {
+      timeoutMs: 10_000,
+    })
+    await noteForClaude(
+      $,
+      `[artifact-watchdog] Matthew pressed Stop on stalled subagent "${w.label}" (${agentId}), but TaskStop ` +
+        `${failure}. The agent may still be running: TaskStop agent ${agentId} yourself and do the task inline.`,
+    )
+    return
+  }
+  const summary = 'stopped from the pane'
   await update($, watches, list =>
     list.map(one => (one.id === w.id && one.status === 'stopping' ? { ...one, status: 'stopped' as const, summary } : one)),
   )
