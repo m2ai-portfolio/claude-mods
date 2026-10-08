@@ -1,12 +1,10 @@
 # Third-party notices
 
-Three mods in this repo are copied unchanged from other projects. Their licenses and copyright notices are kept here as those licenses require.
+One mod in this repo is copied unchanged from another project. Its license and copyright notice are kept here as that license requires.
 
 | Folder | Source | License |
 |---|---|---|
 | `flight-recorder/` | [promptadvisers/claude-mods-starter-kit](https://github.com/promptadvisers/claude-mods-starter-kit) @ 36f76db | MIT, Copyright (c) 2026 Prompt Advisers |
-| `prompt-cache-control/` | [davila7/claude-code-templates](https://github.com/davila7/claude-code-templates) @ 6e0fc0f | MIT, Copyright (c) 2025 Daniel (San) Ávila |
-| `next-steps/` | [anthropics/claude-plugins-community](https://github.com/anthropics/claude-plugins-community) @ 2ead8ff, by Thariq Shihipar | MIT (declared in the plugin's `plugin.json`); the source repository as a whole is Apache-2.0 |
 
 ## MIT License
 

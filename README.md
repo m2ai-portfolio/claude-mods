@@ -8,8 +8,6 @@ Claude Code mods (function-hooks plugins) and skills. Each mod lives in its own 
 | `auto-handoff` | Writes a `/next` handoff automatically once a long session crosses a token threshold |
 | `flight-recorder` | Live timeline of model requests, tool calls and subagents in a turn |
 | `jev-tool-gate` | Log-only judgment of risky tool calls; never changes a decision |
-| `next-steps` | Suggests up to three next prompts after each turn |
-| `prompt-cache-control` | Prompt-cache meter and expiry countdown above the prompt |
 | `skills/next`, `skills/prime` | Session handoff skills, see below |
 
 ## Skills: /next and /prime
