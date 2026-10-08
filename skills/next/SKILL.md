@@ -38,14 +38,15 @@ Write the draft to a scratch/temp file (not into `~/handoffs`). Target under 500
 Date: <YYYY-MM-DD HH:MM with timezone>
 Project: <project>
 Working directory: <absolute path>
-Harness: <Claude Code / Codex / other, plus model>. Session: <id or unknown>
+Harness: <Claude Code / Codex / other, plus model>. Session: <id or unknown; in Claude Code, $CLAUDE_CODE_SESSION_ID>
 
 ## Where we are
-<What is done and verified, and the current state: uncommitted changes, running processes, partial work.>
+<What is done and verified, and the current state: uncommitted changes, running processes, partial work. Name the checks that ran (command and result) and the checks that did NOT run; never call an unrun test passed.>
 
 ## What we decided
 - <Decision. Why: reason.>
-<One bullet per decision made THIS session. Write "- None" if there were none. Each bullet becomes one line in DECISIONS.md, so make it stand alone.>
+- Rejected: <a direction turned down that a later session might retry>. Why: <reason>.
+<One bullet per decision made THIS session, including rejected directions worth remembering. Write "- None" if there were none. Each bullet becomes one line in DECISIONS.md, so make it stand alone.>
 
 ## Next step
 <The single first concrete action for the next session, and why it is next.>
@@ -60,7 +61,7 @@ Harness: <Claude Code / Codex / other, plus model>. Session: <id or unknown>
 
 ## Claims to verify
 - <A fact the next session depends on> : `<read-only command that checks it>`
-<3 to 6 items. /prime runs these before acting. Read-only commands only: test suites and builds write temp files, so /prime may refuse them. Point to the last result under References instead.>
+<3 to 6 items. /prime runs these before acting. Read-only commands only, built from plain read-only programs (git, grep, jq, ls, sha256sum): `handoff.mjs claims` sorts each one, and /prime runs only those and asks before anything else, such as a script. Test suites and builds write temp files, so point to the last result under References instead.>
 
 ## References
 <Absolute paths, commits, issue IDs, plans. Point to detail; do not copy it.>
@@ -78,7 +79,7 @@ Content rules:
 node $H save --slug <2-4-word-kebab-slug> --file <draft path> [--project <name>]
 ```
 
-It stores `~/handoffs/<project>/YYYY-MM-DD-HHMM-<slug>.md`, adds the `Supersedes:` link, moves `LATEST`, and appends the decision bullets to `DECISIONS.md`. Handoffs are immutable: to correct one after saving, save a new handoff rather than editing the old file.
+It stores `~/handoffs/<project>/YYYY-MM-DD-HHMM-<slug>.md`, adds the `Supersedes:` link, moves `LATEST`, and appends the decision bullets to `DECISIONS.md`. For a Claude Code draft it also stamps `Transcript-Cutoff: <uuid> <timestamp>`, the newest entry of the session's transcript at save time (Session id from the draft, else `$CLAUDE_CODE_SESSION_ID`), so `/prime` can show anything said after the handoff. Do not write that line yourself. Anything you and the user say after `save` is not in the handoff; if it matters, save a new handoff. Handoffs are immutable: to correct one after saving, save a new handoff rather than editing the old file.
 
 ## Step 5: Return to the user
 
@@ -90,4 +91,6 @@ Print the saved handoff, its path, and the pickup line:
 
 - Handoffs live in `~/handoffs/<project>/`. Set `HANDOFF_ROOT` to store them elsewhere.
 - The helper is plain Node (no dependencies). Its tests: `node --test ~/.claude/skills/next/scripts/handoff.test.mjs`.
+- `claims <handoff>` sorts the handoff's "Claims to verify" commands into `RUN` (only reads) and `ASK` (a script, a write, a credential file), and says whether a session or another agent (`origin: worker`) wrote it; /prime runs it before verifying.
+- `save --cutoff "<uuid> <iso>"|none` stamps a given Transcript-Cutoff instead of reading the transcript at save time; the auto-handoff mod passes the entry read just before its fork. `cutoff --session <id> [--fork]` prints one, `tail <handoff>` reads what came after it (the `/prime` tail check), and `decide` appends an approved tail decision to `DECISIONS.md`. Transcripts are read from `~/.claude/projects` (`CLAUDE_PROJECTS_ROOT` overrides it in tests).
 - `save --key <K>` is an idempotent keyed save for automated runs: the draft must carry the line `Attempt-Key: <K>`, and a rerun after a crash repairs `LATEST` and `DECISIONS.md` instead of writing a second handoff.

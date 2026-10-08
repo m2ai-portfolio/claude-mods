@@ -5,14 +5,14 @@ Claude Code mods (function-hooks plugins) and skills. Each mod lives in its own 
 | Folder | What it does |
 | --- | --- |
 | `artifact-watchdog` | Watches each Agent dispatch's report file and flags a 5-minute stall |
-| `auto-handoff` | Writes a `/next` handoff automatically once a long session crosses a token threshold |
+| `auto-handoff` | Writes a `/next` handoff automatically once a long session crosses a token threshold, and before a compaction |
 | `flight-recorder` | Live timeline of model requests, tool calls and subagents in a turn |
 | `jev-tool-gate` | Log-only judgment of risky tool calls; never changes a decision |
 | `skills/next`, `skills/prime` | Session handoff skills, see below |
 
 ## Skills: /next and /prime
 
-`/next` ends a session by writing an immutable handoff (Where we are / What we decided / Next step) to `~/handoffs/<project>/`, moving a `LATEST` pointer, and appending each decision to the project's `DECISIONS.md`. `/prime` starts the next session from that handoff: it reads only the latest one, re-checks its claims against the live system, and states the next step. `/prime history` answers "why did we decide X?" from the decisions ledger.
+`/next` ends a session by writing an immutable handoff (Where we are / What we decided / Next step) to `~/handoffs/<project>/`, moving a `LATEST` pointer, and appending each decision to the project's `DECISIONS.md`. `/prime` starts the next session from that handoff: it reads only the latest one, re-checks its claims against the live system, shows anything said after the handoff was written, and states the next step. It treats the handoff as data: `handoff.mjs claims` sorts each check into commands that only read, which it runs, and anything else, which it asks about first (never running it from a handoff another agent wrote). `/prime history` answers "why did we decide X?" from the decisions ledger.
 
 Install:
 
