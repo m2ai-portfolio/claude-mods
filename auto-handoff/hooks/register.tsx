@@ -20,6 +20,12 @@
 // subagent, never for a plugin's own call, never for TaskStop. Each refusal
 // rereads the context first, so after a /clear or compaction it re-arms on
 // the spot instead of blocking the /prime that follows.
+// session.compact (main loop, any window size): before a compaction drops
+// detail, write a handoff from the full transcript first, unless one already
+// covers this context window (saved since the last /clear or compaction) or
+// one is being written. It never blocks tool calls and never stops the
+// compaction: a failed write is reported and the compaction goes on.
+// (Adopted from Prompt Advisers' auto-handoff mod, 2026-10-08.)
 // /auto-handoff: status; "now" writes one immediately; "unblock" lifts the
 // block for the rest of this window.
 
@@ -45,6 +51,7 @@ const isDismissed = atom({ plugin: 'auto-handoff', key: 'isDismissed' } as const
 const isBlocked = atom({ plugin: 'auto-handoff', key: 'isBlocked' } as const, false)
 const isLifted = atom({ plugin: 'auto-handoff', key: 'isLifted' } as const, false)
 const isRetiring = atom({ plugin: 'auto-handoff', key: 'isRetiring' } as const, false)
+const isCovered = atom({ plugin: 'auto-handoff', key: 'isCovered' } as const, false)
 
 let isWriting = false
 // A retire in flight: a second press must not rename or archive twice.
@@ -83,6 +90,30 @@ export const register: Register = on => {
       })
     }
     return result
+  })
+
+  on('session.compact', async ($, e, next) => {
+    if (e.trigger === 'precompute' || e.agentId !== undefined) {
+      return next(e)
+    }
+    const { context } = await $.session.usage()
+    if (!isWriting && context.tokens !== undefined && !(await read($, isCovered))) {
+      await writeHandoff($, context.tokens, false, `the conversation is about to be compacted (${e.trigger})`)
+    }
+    const result = await next(e)
+    if (!('skip' in result && result.skip)) {
+      await update($, isCovered, () => false)
+    }
+    return result
+  })
+
+  // A /clear ends this conversation (the process goes on): what was saved
+  // covers the old window, not the new one.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      await update($, isCovered, () => false)
+    }
+    return next(e)
   })
 
   on('tool.call', async ($, e, next) => {
@@ -133,6 +164,9 @@ export const register: Register = on => {
         ? `Auto-handoff fires at ${short(THRESHOLD)}.`
         : `Auto-handoff is off for this session: it applies only to a ${short(WINDOW)} window.`,
       run ? `Last: ${run.status}${run.path ? ` ${run.path}` : ''}${run.detail ? ` (${run.detail})` : ''}` : 'Last: none yet.',
+      (await read($, isCovered))
+        ? 'Before a compaction: no new handoff, the last one covers this window.'
+        : 'Before a compaction: writes a handoff first.',
       (await read($, isBlocked))
         ? 'Tool calls: BLOCKED (/auto-handoff unblock lifts it).'
         : (await read($, isLifted))
@@ -216,6 +250,7 @@ export const register: Register = on => {
 // The fork's instructions: /next Steps 2-3, with the facts a tool-less
 // completion cannot look up handed to it.
 function forkPrompt(facts: {
+  why: string
   now: string
   cwd: string
   project: string | null
@@ -228,7 +263,7 @@ function forkPrompt(facts: {
   previous: string
 }): string {
   return [
-    `[auto-handoff] This session has reached ${facts.tokens} tokens of a 1,000,000-token window.`,
+    `[auto-handoff] ${facts.why} (${facts.tokens} tokens).`,
     'Write the /next handoff for this session now. You have no tools: do not try to run anything,',
     'and do not do any of the remaining work. Use only this conversation and the facts below.',
     '',
@@ -256,21 +291,24 @@ function forkPrompt(facts: {
     `Attempt-Key: ${facts.key}`,
     '',
     '## Where we are',
-    '<What is done and verified, and the current state: uncommitted changes, running processes, partial work.>',
+    '<What is done and verified, and the current state: uncommitted changes, running processes, partial work.',
+    'Name the checks that ran (command and result) and the checks that did NOT run; never call an unrun test passed.>',
     '',
     '## What we decided',
     '- <Decision. Why: reason.> (one standalone bullet per decision made THIS session, or "- None")',
+    '- Rejected: <a direction turned down that a later session might retry>. Why: <reason>.',
     '',
     '## Next step',
     '<The single first concrete action for the next session, and why it is next.>',
     '',
     '## Remaining',
     '### Ready',
-    '### Needs Matthew',
+    '### Needs you',
     '### Later',
     '',
     '## Claims to verify',
-    '- <A fact the next session depends on> : `<read-only command that checks it>` (3 to 6 items)',
+    '- <A fact the next session depends on> : `<read-only command that checks it>` (3 to 6 items;',
+    '  plain read-only programs such as git, grep, jq, ls: /prime runs those, and asks before anything else)',
     '',
     '## References',
     '<Absolute paths, commits, issue IDs, plans. Point to detail; do not copy it.>',
@@ -335,8 +373,14 @@ async function blockReason($: EngineInterface): Promise<string | null> {
 }
 
 // isThreshold: started by crossing the threshold, so a save blocks tool
-// calls. "/auto-handoff now" passes false: an on-demand handoff never blocks.
-async function writeHandoff($: EngineInterface, tokens: number, isThreshold: boolean): Promise<void> {
+// calls. "/auto-handoff now" and a compaction pass false: those never block.
+// why: the fork's first line, what prompted this handoff.
+async function writeHandoff(
+  $: EngineInterface,
+  tokens: number,
+  isThreshold: boolean,
+  why = 'This session has reached its handoff point in a 1,000,000-token window',
+): Promise<void> {
   if (isWriting) {
     return
   }
@@ -372,6 +416,7 @@ async function writeHandoff($: EngineInterface, tokens: number, isThreshold: boo
 
     // /next Step 3: the draft, from the session's own context.
     const prompt = forkPrompt({
+      why,
       now: (await exec($, ['date', '+%Y-%m-%d %H:%M %Z'])).out,
       cwd,
       project: resolved.ok ? resolved.out : null,
@@ -413,6 +458,7 @@ async function writeHandoff($: EngineInterface, tokens: number, isThreshold: boo
       return
     }
     await setRun($, { status: 'saved', tokens, project, path: saved.out, detail: '' })
+    await update($, isCovered, () => true)
     if (isThreshold && !(await read($, isLifted))) {
       await update($, isBlocked, () => true)
     }

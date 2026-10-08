@@ -28,6 +28,9 @@ declare module 'claude-code' {
       // The band's "Retire this session" toggle: the pickup button renames and
       // archives this session instead of clearing it (desktop only).
       isRetiring: boolean
+      // A handoff saved since the last /clear or compaction: a compaction
+      // then goes ahead without writing another.
+      isCovered: boolean
     }
   }
 }

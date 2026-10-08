@@ -50,6 +50,9 @@ type World = {
   cutoff?: string | null
 }
 
+// A compaction leaves at least one message: the summary.
+const SUMMARY = [{ role: 'user' as const, text: 'Summary of the conversation so far.', toolUses: [] }]
+
 const CUTOFF = '5d6fe2e0-4e96-4002-b681-c1aec6d962a7 2026-10-04T15:00:01.903Z'
 
 function world(on: On, w: World) {
@@ -77,6 +80,12 @@ function world(on: On, w: World) {
     value: { startedAt: 0, context: { tokens: w.tokens, window: w.window }, rateLimits: [] },
   }))
   on('session.cwd', () => ({ value: w.cwd }))
+  // The engine's own compaction and end step, recorded in order with the fork.
+  on('session.compact', ($, e) => {
+    order.push(`compact ${e.trigger}`)
+    return { messages: SUMMARY }
+  })
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.id', () => ({ value: 'abcdef1234567890' }))
   on('session.model', () => ({ value: 'claude-opus-5-5' }))
   on('model.fork', async ($, e) => {
@@ -138,6 +147,18 @@ function world(on: On, w: World) {
     return bad(`unexpected ${e.argv.join(' ')}`)
   })
   return { clock, saves, writes, prompts, toasts, commands, gate, ran, sessions, copies, order, cutoffs }
+}
+
+async function compact(
+  $: Parameters<TestBody>[0],
+  trigger: 'manual' | 'auto' | 'plugin' | 'precompute' = 'manual',
+  agentId?: string,
+) {
+  return $.session.compact({ trigger, messages: [...SUMMARY, ...SUMMARY], agentId })
+}
+
+async function clear($: Parameters<TestBody>[0]) {
+  await $.session.end({ reason: 'clear', sessionId: 'abcdef1234567890', resume: { id: 'abcdef1234567890' } })
 }
 
 async function turn($: Parameters<TestBody>[0], agentId?: string) {
@@ -549,5 +570,89 @@ describe('tool-call block', () => {
     await t.clock.advance(5)
     expect(t.saves.length).toBe(2)
     expect((await bash($)).deny).toBeDefined()
+  })
+
+})
+
+describe('compaction', () => {
+  test('a compaction with no handoff in this window writes one first, in any window size', async ($, on) => {
+    const w: World = { tokens: 150_000, window: 200_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    const result = await compact($, 'auto')
+    // The fork reads the full transcript before the compaction replaces it.
+    expect(t.order).toEqual(['cutoff', 'fork', 'compact auto'])
+    expect(result.messages).toEqual(SUMMARY)
+    expect(t.saves.length).toBe(1)
+    expect(t.prompts[0]).toContain('the conversation is about to be compacted (auto) (150000 tokens)')
+    // A compaction handoff never blocks the session.
+    await $.tool.call({ tool: 'Read', input: {}, toolUseId: 'u1' })
+    expect(t.ran).toEqual(['Read'])
+  })
+
+  test('a handoff saved in this window covers the compaction; the next window needs its own', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+
+    await compact($, 'manual')
+    expect(t.saves.length).toBe(1)
+    expect(t.order).toEqual(['cutoff', 'fork', 'compact manual'])
+
+    // Compacted: the summary window has no handoff of its own yet.
+    w.tokens = 120_000
+    await compact($, 'manual')
+    expect(t.saves.length).toBe(2)
+    expect(arg(t.saves[1]!, '--key')).toBe('auto-abcdef12-2')
+  })
+
+  test('a /clear uncovers the window: the next compaction writes again', async ($, on) => {
+    const w: World = { tokens: 40_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await $.command.run(NOW)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+    await clear($)
+    await compact($, 'manual')
+    expect(t.saves.length).toBe(2)
+  })
+
+  test('precompute, a subagent compaction, and an empty window write nothing', async ($, on) => {
+    const w: World = { tokens: 150_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await compact($, 'precompute')
+    await compact($, 'auto', 'agent-1')
+    w.tokens = undefined
+    await compact($, 'manual')
+    expect(t.prompts.length).toBe(0)
+    expect(t.order).toEqual(['compact precompute', 'compact auto', 'compact manual'])
+  })
+
+  test('a failed compaction handoff is reported and the compaction still runs', async ($, on) => {
+    const w: World = { tokens: 150_000, window: 1_000_000, cwd: '/work/my-proj', forkText: 'no draft here' }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    const result = await compact($, 'manual')
+    expect(result.messages).toEqual(SUMMARY)
+    expect(t.saves.length).toBe(0)
+    expect(t.toasts.at(-1)).toContain('Auto-handoff failed')
+    expect(t.order.at(-1)).toBe('compact manual')
+  })
+
+  test('the fork is asked for checks not run, rejected directions, and plain read-only claims', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.prompts[0]).toContain('checks that did NOT run')
+    expect(t.prompts[0]).toContain('- Rejected: <')
+    expect(t.prompts[0]).toContain('/prime runs those, and asks before anything else')
+    expect(t.prompts[0]).toContain('### Needs you')
   })
 })
