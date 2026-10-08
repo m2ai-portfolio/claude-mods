@@ -46,7 +46,7 @@ Harness: <Claude Code / Codex / other, plus model>. Session: <id or unknown; in 
 ## What we decided
 - <Decision. Why: reason.>
 - Rejected: <a direction turned down that a later session might retry>. Why: <reason>.
-<One bullet per decision made THIS session, including rejected directions worth remembering. Write "- None" if there were none. Each bullet becomes one line in DECISIONS.md, so make it stand alone.>
+<One bullet per decision made THIS session, including rejected directions worth remembering. Write exactly "- None", with nothing after it, if there were none. An offer still waiting for approval is not a decision: put it under Needs you. Each bullet becomes one line in DECISIONS.md, so make it stand alone.>
 
 ## Next step
 <The single first concrete action for the next session, and why it is next.>

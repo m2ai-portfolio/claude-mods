@@ -392,3 +392,37 @@ test("claims prints the origin, one verdict per claim, and a worker warning", ()
     "",
   ].join("\n"));
 });
+
+// 2026-10-08: "- None. Matthew has not responded since the summary." reached DECISIONS.md
+// because the filter matched only a bare "None". An empty-section marker with any
+// explanation after it is still not a decision; a real one that starts with "None of" is.
+import { extractDecisions } from "./handoff.mjs";
+
+test("extractDecisions drops empty-section markers that carry an explanation", () => {
+  const md = (bullets) => `## What we decided\n${bullets.map((b) => `- ${b}`).join("\n")}\n\n## Next step\nx\n`;
+  for (const empty of [
+    "None",
+    "None.",
+    "None. Matthew has not responded since the summary.",
+    "None (the rulings on attempt 1 are in the previous handoff).",
+    "None: nothing was settled.",
+    "None, the session was read-only.",
+    "**None.**",
+    "N/A",
+    "No decisions.",
+    "No new decisions this session.",
+    "No decisions were made this session.",
+    "Nothing decided.",
+    "Nothing was decided this session.",
+  ]) {
+    assert.deepEqual(extractDecisions(md([empty])), [], `kept: ${empty}`);
+  }
+  for (const real of [
+    "None of the three vendors fit; build it in-house. Why: lock-in.",
+    "Nothing ships to Mark until Matthew picks a channel. Why: external contact.",
+    "No decisions without a card Yes. Why: authority rule.",
+    "Rejected: posting the draft now. Why: no approval.",
+  ]) {
+    assert.deepEqual(extractDecisions(md([real])), [real], `dropped: ${real}`);
+  }
+});

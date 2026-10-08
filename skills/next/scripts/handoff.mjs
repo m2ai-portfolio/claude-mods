@@ -115,8 +115,15 @@ export function extractDecisions(md) {
     .map((l) => l.match(/^\s*[-*]\s+(.*\S)\s*$/))
     .filter(Boolean)
     .map((x) => x[1])
-    .filter((t) => !/^(none|n\/a|no decisions?)\.?$/i.test(t));
+    .filter((t) => !EMPTY_DECISION.test(t));
 }
+
+// "- None" marks an empty section, and drafts add an explanation after it ("None. Matthew
+// has not responded", "None (the rulings are in the previous handoff)"). The marker must
+// end the bullet or meet punctuation, so a real decision such as "None of the vendors fit"
+// still reaches the ledger.
+const EMPTY_DECISION =
+  /^[*_]*(?:none|n\/a|nothing(?: (?:new|was))? decided|no(?: new)? decisions?(?: (?:were|was) made)?)(?: this session)?[*_]*\s*(?:$|[.;:,(\u2014-])/i;
 
 const attemptKeyOf = (md) => md.match(/^Attempt-Key:\s*(\S+)\s*$/m)?.[1] ?? null;
 
