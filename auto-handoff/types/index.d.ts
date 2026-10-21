@@ -9,6 +9,15 @@ export type HandoffRun = {
   detail: string
 }
 
+// Kept across sessions under the plugin's store key "settings", written by
+// /auto-handoff on|off and threshold <n>; absent fields fall back to the
+// defaults (on, 300k tokens).
+export type AutoHandoffSettings = {
+  // Tokens, 1 up to but not including the 1M window.
+  threshold: number
+  isEnabled: boolean
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'auto-handoff': {

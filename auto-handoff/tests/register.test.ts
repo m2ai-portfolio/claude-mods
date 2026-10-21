@@ -48,6 +48,8 @@ type World = {
   archiveError?: string
   // What `handoff.mjs cutoff` prints; null, it fails (no transcript). Absent, CUTOFF.
   cutoff?: string | null
+  // The plugin's store as an earlier session left it; absent, empty.
+  store?: Record<string, unknown>
 }
 
 // A compaction leaves at least one message: the summary.
@@ -73,6 +75,8 @@ function world(on: On, w: World) {
   const cutoffs: string[][] = []
   const clock = mock.clock(on, { now: 1_000_000 })
   mock.env(on, { HOME: '/home/apexaipc' })
+  // The plugin's own store (the on/off switch and threshold).
+  mock.store(on, w.store)
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
@@ -420,15 +424,121 @@ describe('no tool-call block', () => {
     expect(status).not.toContain('BLOCKED')
   })
 
-  test('"unblock" is no longer a verb: it reads as status', async ($, on) => {
+  test('"unblock" is no longer a verb: it prints the usage line', async ($, on) => {
     const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
     const t = world(on, w)
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
     await turn($)
     await t.clock.advance(5)
     const text = (await $.command.run({ ...NOW, args: 'unblock' })).text
-    expect(text).toContain('Context: 300k of 1M')
+    expect(text).toBe('Usage: /auto-handoff [now|threshold <n>|on|off]')
     expect(text).not.toContain('unblocked')
+  })
+})
+
+// /auto-handoff on|off and threshold <n>, as Mark's upstream has them: kept in
+// the plugin's store across sessions; "now" ignores the switch.
+describe('toggles', () => {
+  const run = (args: string) => ({ ...NOW, args })
+
+  test('off skips the threshold and the compaction handoff; "now" still writes; on resumes', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+
+    expect((await $.command.run(run('off'))).text).toBe(
+      'Auto-handoff is off: no handoff at the threshold or before a compaction. /auto-handoff now still writes one.',
+    )
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.prompts.length).toBe(0)
+    await compact($, 'manual')
+    expect(t.order).toEqual(['compact manual'])
+    expect(t.saves.length).toBe(0)
+
+    const status = (await $.command.run(run(''))).text
+    expect(status).toContain('Auto-handoff: off (threshold 300k); /auto-handoff on to resume.')
+    expect(status).toContain('Before a compaction: nothing, auto-handoff is off.')
+    expect(status).toContain('Commands: /auto-handoff now, threshold <n>, on, off.')
+
+    expect((await $.command.run(run('now'))).text).toContain('Writing a handoff now')
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+
+    expect((await $.command.run(run('on'))).text).toBe('Auto-handoff is on: fires at 300k and before a compaction.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(2)
+    expect(arg(t.saves[1]!, '--key')).toBe('auto-abcdef12-2')
+    expect((await $.command.run(run('status'))).text).toContain('Auto-handoff: on, fires at 300k.')
+  })
+
+  test('threshold <n> moves the line, takes k and M, re-arms, and refuses bad values', async ($, on) => {
+    const w: World = { tokens: 250_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(0)
+
+    expect((await $.command.run(run('threshold 200k'))).text).toBe('Auto-handoff threshold set to 200k tokens.')
+    expect((await $.command.run(run(''))).text).toContain('Auto-handoff: on, fires at 200k.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+
+    // Fired and disarmed at 250k; a new line below the fill re-arms without a dip.
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+    expect((await $.command.run(run('threshold 240000'))).text).toBe('Auto-handoff threshold set to 240k tokens.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(2)
+
+    expect((await $.command.run(run('threshold 0.5M'))).text).toBe('Auto-handoff threshold set to 500k tokens.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(2)
+
+    const usage = 'Usage: /auto-handoff threshold <tokens>, from 1 up to but not including 1M (e.g. 250k or 250000).'
+    // The value is the first word after the verb, as upstream reads it; a
+    // trailing word is ignored, so only the value itself can be malformed.
+    for (const bad of ['', 'abc', '0', '-5', '1M', '2M', 'k', '1e5', '300,000']) {
+      expect((await $.command.run(run(`threshold ${bad}`))).text).toBe(usage)
+    }
+    // A refused value leaves the stored one alone.
+    expect((await $.command.run(run(''))).text).toContain('fires at 500k')
+  })
+
+  test('settings saved by an earlier session are read back: off and 200k from the store', async ($, on) => {
+    const w: World = {
+      tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT,
+      store: { settings: { threshold: 200_000, isEnabled: false } },
+    }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    const status = (await $.command.run(run(''))).text
+    expect(status).toContain('Auto-handoff: off (threshold 200k)')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(0)
+
+    // "on" keeps the stored threshold; a malformed stored entry falls back to 300k.
+    expect((await $.command.run(run('on'))).text).toBe('Auto-handoff is on: fires at 200k and before a compaction.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
+  })
+
+  test('a malformed store entry falls back to on and 300k', async ($, on) => {
+    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT, store: { settings: 'garbage' } }
+    const t = world(on, w)
+    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
+    expect((await $.command.run(run(''))).text).toContain('Auto-handoff: on, fires at 300k.')
+    await turn($)
+    await t.clock.advance(5)
+    expect(t.saves.length).toBe(1)
   })
 })
 

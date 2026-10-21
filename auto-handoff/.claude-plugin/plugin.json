@@ -1,6 +1,6 @@
 {
   "name": "auto-handoff",
   "version": "0.1.0",
-  "description": "Writes a /next handoff automatically once a 1M-token session crosses 300k tokens and before every compaction, so the next session can /prime from it. Never blocks tool calls: goals and loops keep running (pair with autoCompactWindow: 300000).",
+  "description": "Writes a /next handoff automatically once a 1M-token session crosses 300k tokens and before every compaction, so the next session can /prime from it. Never blocks tool calls: goals and loops keep running (pair with autoCompactWindow: 300000). /auto-handoff on|off and threshold <n> are kept across sessions.",
   "types": "./types/index.d.ts"
 }

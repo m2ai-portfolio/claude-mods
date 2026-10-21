@@ -27,15 +27,20 @@
 // one is being written. It never blocks tool calls and never stops the
 // compaction: a failed write is reported and the compaction goes on.
 // (Adopted from Prompt Advisers' auto-handoff mod, 2026-10-08.)
-// /auto-handoff: status; "now" writes one immediately.
+// /auto-handoff: status; "now" writes one immediately; "on" and "off" switch
+// the automatic handoffs (threshold and pre-compaction; "now" still works);
+// "threshold <n>" moves the line (tokens, e.g. 250k). Both are kept across
+// sessions in the plugin's own store, as Mark's upstream keeps them.
 
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { HandoffRun } from '../types'
+import type { AutoHandoffSettings, HandoffRun } from '../types'
 
 const WINDOW = 1_000_000
-const THRESHOLD = 300_000
+const DEFAULT_THRESHOLD = 300_000
+// The store key for the on/off switch and the threshold.
+const SETTINGS = 'settings'
 // The desktop app's session tools, reached with the engine's own connection.
 const SESSIONS = 'ccd_session_mgmt'
 
@@ -55,7 +60,8 @@ export const register: Register = on => {
     const result = await next(e)
     await $.command.register({
       name: 'auto-handoff',
-      description: 'Auto-handoff status; "now" writes a /next handoff immediately',
+      description: 'Auto-handoff status, or now | threshold <n> | on | off',
+      argumentHint: '[now|threshold <n>|on|off]',
     })
     return result
   })
@@ -70,8 +76,12 @@ export const register: Register = on => {
     if (context.window !== WINDOW) {
       return result
     }
-    if (tokens < THRESHOLD) {
+    const { threshold, isEnabled } = await settings($)
+    if (tokens < threshold) {
       await rearm($)
+      return result
+    }
+    if (!isEnabled) {
       return result
     }
     const { value: armed = true } = await $.state.get({ plugin: 'auto-handoff', key: 'isArmed' } as const)
@@ -90,7 +100,8 @@ export const register: Register = on => {
       return next(e)
     }
     const { context } = await $.session.usage()
-    if (!isWriting && context.tokens !== undefined && !(await read($, isCovered))) {
+    const { isEnabled } = await settings($)
+    if (isEnabled && !isWriting && context.tokens !== undefined && !(await read($, isCovered))) {
       await writeHandoff($, context.tokens, `the conversation is about to be compacted (${e.trigger})`)
     }
     const result = await next(e)
@@ -110,7 +121,8 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'auto-handoff' }, async ($, e) => {
-    if (e.args.trim() === 'now') {
+    const [verb = '', value = ''] = e.args.trim().split(/\s+/)
+    if (verb === 'now') {
       if (isWriting) {
         return { text: 'An auto-handoff is already being written.' }
       }
@@ -127,19 +139,50 @@ export const register: Register = on => {
       })
       return { text: 'Writing a handoff now. The band above the prompt shows when it is saved.' }
     }
+    if (verb === 'on' || verb === 'off') {
+      const stored = asObject(await $.store.get(SETTINGS))
+      await $.store.set(SETTINGS, { ...stored, isEnabled: verb === 'on' })
+      return {
+        text:
+          verb === 'on'
+            ? `Auto-handoff is on: fires at ${short((await settings($)).threshold)} and before a compaction.`
+            : 'Auto-handoff is off: no handoff at the threshold or before a compaction. /auto-handoff now still writes one.',
+      }
+    }
+    if (verb === 'threshold') {
+      const n = toThreshold(value)
+      if (n === undefined) {
+        return { text: `Usage: /auto-handoff threshold <tokens>, from 1 up to but not including ${short(WINDOW)} (e.g. 250k or 250000).` }
+      }
+      const stored = asObject(await $.store.get(SETTINGS))
+      await $.store.set(SETTINGS, { ...stored, threshold: n })
+      // Armed again: the next turn at or past the new line writes, as on a
+      // fresh crossing.
+      await rearm($)
+      return { text: `Auto-handoff threshold set to ${short(n)} tokens.` }
+    }
+    if (verb !== '' && verb !== 'status') {
+      return { text: 'Usage: /auto-handoff [now|threshold <n>|on|off]' }
+    }
     const { context } = await $.session.usage()
     const { value: run } = await $.state.get({ plugin: 'auto-handoff', key: 'last' } as const)
+    const { threshold, isEnabled } = await settings($)
     const tokens = context.tokens ?? 0
     const lines = [
       `Context: ${short(tokens)} of ${short(context.window)}.`,
-      context.window === WINDOW
-        ? `Auto-handoff fires at ${short(THRESHOLD)}.`
-        : `Auto-handoff is off for this session: it applies only to a ${short(WINDOW)} window.`,
+      !isEnabled
+        ? `Auto-handoff: off (threshold ${short(threshold)}); /auto-handoff on to resume.`
+        : context.window === WINDOW
+          ? `Auto-handoff: on, fires at ${short(threshold)}.`
+          : `Auto-handoff: on, but idle for this session: the threshold applies only to a ${short(WINDOW)} window.`,
       run ? `Last: ${run.status}${run.path ? ` ${run.path}` : ''}${run.detail ? ` (${run.detail})` : ''}` : 'Last: none yet.',
-      (await read($, isCovered))
-        ? 'Before a compaction: no new handoff, the last one covers this window.'
-        : 'Before a compaction: writes a handoff first.',
+      !isEnabled
+        ? 'Before a compaction: nothing, auto-handoff is off.'
+        : (await read($, isCovered))
+          ? 'Before a compaction: no new handoff, the last one covers this window.'
+          : 'Before a compaction: writes a handoff first.',
       'Tool calls: never blocked; the context compacts at the autoCompactWindow setting instead.',
+      'Commands: /auto-handoff now, threshold <n>, on, off.',
     ]
     return { text: lines.join('\n') }
   })
@@ -293,10 +336,40 @@ async function setRun($: EngineInterface, value: HandoffRun): Promise<void> {
   await update($, isDismissed, () => false)
 }
 
-// Below the threshold again (a /clear, a compaction): the next crossing may
-// write again.
+// Below the threshold again (a /clear, a compaction), or the threshold moved:
+// the next crossing may write again.
 async function rearm($: EngineInterface): Promise<void> {
   await update($, isArmed, () => true)
+}
+
+// The on/off switch and the threshold, from the plugin's store; a missing or
+// malformed entry falls back to the defaults (on, 300k).
+async function settings($: EngineInterface): Promise<AutoHandoffSettings> {
+  const s = asObject(await $.store.get(SETTINGS))
+  return {
+    threshold: toThreshold(s.threshold) ?? DEFAULT_THRESHOLD,
+    isEnabled: typeof s.isEnabled === 'boolean' ? s.isEnabled : true,
+  }
+}
+
+// A token count, as typed (`250000`, `250k`, `0.5M`) or as stored; whole
+// tokens from 1 up to but not including the window. Anything else: undefined.
+function toThreshold(v: unknown): number | undefined {
+  let n: number
+  if (typeof v === 'number') {
+    n = v
+  } else {
+    const m = /^(\d+(?:\.\d+)?)([kKmM])?$/.exec(String(v ?? '').trim())
+    if (!m) return undefined
+    n = Number(m[1]) * (m[2] === undefined ? 1 : m[2].toLowerCase() === 'k' ? 1_000 : 1_000_000)
+  }
+  if (!Number.isFinite(n)) return undefined
+  n = Math.round(n)
+  return n >= 1 && n < WINDOW ? n : undefined
+}
+
+function asObject(v: unknown): Record<string, unknown> {
+  return v !== null && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
 }
 
 // why: the fork's first line, what prompted this handoff.
