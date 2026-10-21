@@ -5,10 +5,23 @@ Claude Code mods (function-hooks plugins) and skills. Each mod lives in its own 
 | Folder | What it does |
 | --- | --- |
 | `artifact-watchdog` | Watches each Agent dispatch's report file and flags a 5-minute stall |
-| `auto-handoff` | Writes a `/next` handoff automatically once a long session crosses a token threshold, and before a compaction |
+| `auto-handoff` | Writes a `/next` handoff automatically once a long session crosses a token threshold, and before a compaction; never blocks tool calls (see below) |
 | `flight-recorder` | Live timeline of model requests, tool calls and subagents in a turn |
 | `jev-tool-gate` | Log-only judgment of risky tool calls; never changes a decision |
 | `skills/next`, `skills/prime` | Session handoff skills, see below |
+
+## auto-handoff and long sessions
+
+`auto-handoff` writes, it never blocks. At 300k tokens of a 1M window it drafts a `/next` handoff from the session's own transcript (`$.model.fork`, no tools), saves it through `handoff.mjs`, and shows a band above the prompt with a **Clear and /prime** button for a human who wants a fresh session. Before any compaction it writes a handoff first, unless one already covers the current window. `/auto-handoff` prints status; `/auto-handoff now` writes one immediately.
+
+Until 2026-10-21 a saved threshold handoff also refused the model's tool calls until `/clear`. That block is gone: it stalled `/goal` and other persistent sessions (a goal turn with every tool denied makes no progress, and `/clear` removes an active goal anyway). The 300k line is owned by Claude Code's own compaction instead. Pair the mod with this setting so the context compacts where the handoff lands and a goal survives it:
+
+```json
+// ~/.claude/settings.json
+{ "autoCompactWindow": 300000 }
+```
+
+Check the window in a new session with `/context` (the `Auto-compact window` line) and the mod with `/auto-handoff` (status ends with `Tool calls: never blocked`).
 
 ## Skills: /next and /prime
 

@@ -384,10 +384,12 @@ async function bash($: Parameters<TestBody>[0], agentId?: string) {
   return $.tool.call({ tool: 'Bash', command: 'ls', tool_use_id: 'tu', ...(agentId ? { agentId } : {}) })
 }
 
-const UNBLOCK = { ...NOW, args: 'unblock' }
-
-describe('tool-call block', () => {
-  test('a saved threshold handoff blocks main-loop tool calls, with the path and the way out', async ($, on) => {
+// Removed 2026-10-21: the block that refused main-loop tool calls after a
+// threshold save. It stalled /goal and other persistent sessions (a goal turn
+// with every tool denied makes no progress, and /clear removes the goal). The
+// handoff still lands; Claude Code's autoCompactWindow owns the 300k line.
+describe('no tool-call block', () => {
+  test('a saved threshold handoff never refuses tool calls, so a goal keeps running', async ($, on) => {
     const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
     const t = world(on, w)
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
@@ -396,182 +398,38 @@ describe('tool-call block', () => {
     await turn($)
     await t.clock.advance(5)
     expect(t.saves.length).toBe(1)
-    const denied = await bash($)
-    expect(denied.deny).toContain(SAVED)
-    expect(denied.deny).toContain('300k')
-    expect(denied.deny).toContain('/prime my-proj')
-    expect(denied.deny).toContain('/auto-handoff unblock')
-    expect(t.ran).toEqual(['Bash'])
-
-    const ui = await $.ui.mount({ plugin: 'auto-handoff', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(JSON.stringify(await ui.findAll({}))).toContain('tool calls are blocked')
-    // Dismiss is withheld while blocked: the band is where the reason shows.
-    expect(await ui.find({ key: 'dismiss' })).toBeUndefined()
-    expect((await $.command.run({ ...NOW, args: '' })).text).toContain('Tool calls: BLOCKED')
-  })
-
-  test('no block while the handoff is still being written', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    let release = () => {}
-    t.gate.hold = new Promise<void>(resolve => {
-      release = resolve
-    })
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect(t.prompts.length).toBe(1)
     expect((await bash($)).deny).toBeUndefined()
-
-    release()
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeDefined()
-  })
-
-  test('a failed write never blocks; the failure band stands', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: 'Sure! Here is a summary.' }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect(t.toasts.at(-1)).toContain('Auto-handoff failed')
-    expect((await bash($)).deny).toBeUndefined()
-    expect(t.ran).toEqual(['Bash'])
-  })
-
-  test('subagent calls and the wrap-up tools pass a block', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeDefined()
-
     expect((await bash($, 'agent-1')).deny).toBeUndefined()
-    const stop = await $.tool.call({ tool: 'TaskStop', task_id: 'agent-1', tool_use_id: 'ts' })
-    expect(stop.deny).toBeUndefined()
     const read = await $.tool.call({ tool: 'Read', file_path: '/etc/hosts', tool_use_id: 'tr' })
-    expect(read.deny).toBeDefined()
-    expect(t.ran).toEqual(['Bash', 'TaskStop'])
-  })
+    expect(read.deny).toBeUndefined()
+    expect(t.ran).toEqual(['Bash', 'Bash', 'Bash', 'Read'])
 
-  test('/auto-handoff unblock lifts it for the rest of the window, even past a later turn', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeDefined()
-
-    expect((await $.command.run(UNBLOCK)).text).toContain('unblocked')
-    expect((await bash($)).deny).toBeUndefined()
+    // Past the threshold, turn after turn: still no refusal, and no second handoff.
     w.tokens = 450_000
     await turn($)
     await t.clock.advance(5)
     expect((await bash($)).deny).toBeUndefined()
     expect(t.saves.length).toBe(1)
+
+    // The band keeps its Dismiss, and the status says so.
     const ui = await $.ui.mount({ plugin: 'auto-handoff', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-    expect(JSON.stringify(await ui.findAll({}))).not.toContain('tool calls are blocked')
+    expect(JSON.stringify(await ui.findAll({}))).not.toContain('blocked until you clear')
+    expect(await ui.find({ key: 'dismiss' })).toBeDefined()
+    const status = (await $.command.run({ ...NOW, args: '' })).text
+    expect(status).toContain('Tool calls: never blocked')
+    expect(status).not.toContain('BLOCKED')
   })
 
-  test('an unblock sent while the handoff is being written keeps the save from blocking', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    let release = () => {}
-    t.gate.hold = new Promise<void>(resolve => {
-      release = resolve
-    })
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect((await $.command.run(UNBLOCK)).text).toContain('were not blocked')
-    release()
-    await t.clock.advance(5)
-    expect(t.saves.length).toBe(1)
-    expect((await bash($)).deny).toBeUndefined()
-  })
-
-  test('dropping below re-arms: the next crossing blocks again, and an earlier unblock does not carry', async ($, on) => {
+  test('"unblock" is no longer a verb: it reads as status', async ($, on) => {
     const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
     const t = world(on, w)
     await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
     await turn($)
     await t.clock.advance(5)
-    await $.command.run(UNBLOCK)
-
-    w.tokens = 60_000
-    await turn($)
-    expect((await bash($)).deny).toBeUndefined()
-    w.tokens = 320_000
-    await turn($)
-    await t.clock.advance(5)
-    expect(t.saves.length).toBe(2)
-    expect((await bash($)).deny).toContain('320k')
+    const text = (await $.command.run({ ...NOW, args: 'unblock' })).text
+    expect(text).toContain('Context: 300k of 1M')
+    expect(text).not.toContain('unblocked')
   })
-
-  test('a /clear between turns re-arms at the first tool call, so /prime can work', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeDefined()
-
-    // /clear typed by hand: no turn ends, the window just empties.
-    w.tokens = undefined
-    expect((await bash($)).deny).toBeUndefined()
-    w.tokens = 310_000
-    expect((await bash($)).deny).toBeUndefined()
-  })
-
-  test('the Clear and /prime button lifts the block before /prime runs', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    const ui = await $.ui.mount({ plugin: 'auto-handoff', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
-    await ui.press({ key: 'pickup' })
-    expect(t.commands).toEqual(['/clear', '/prime my-proj'])
-    expect((await bash($)).deny).toBeUndefined()
-  })
-
-  test('"/auto-handoff now" saves a handoff but never blocks, even past the threshold', async ($, on) => {
-    const w: World = { tokens: 350_000, window: 1_000_000, cwd: '/work/my-proj', forkText: 'Sure! Here is a summary.' }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect(t.toasts.at(-1)).toContain('Auto-handoff failed')
-
-    w.forkText = DRAFT
-    await $.command.run(NOW)
-    await t.clock.advance(5)
-    expect(t.saves.length).toBe(1)
-    expect((await bash($)).deny).toBeUndefined()
-  })
-
-  test('a later handoff being written suspends the block until it saves', async ($, on) => {
-    const w: World = { tokens: 300_000, window: 1_000_000, cwd: '/work/my-proj', forkText: DRAFT }
-    const t = world(on, w)
-    await $.session.start({ surface: 'terminal', isInteractive: true, cwd: w.cwd })
-    await turn($)
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeDefined()
-
-    let release = () => {}
-    t.gate.hold = new Promise<void>(resolve => {
-      release = resolve
-    })
-    await $.command.run(NOW)
-    await t.clock.advance(5)
-    expect((await bash($)).deny).toBeUndefined()
-    release()
-    await t.clock.advance(5)
-    expect(t.saves.length).toBe(2)
-    expect((await bash($)).deny).toBeDefined()
-  })
-
 })
 
 describe('compaction', () => {
@@ -586,7 +444,7 @@ describe('compaction', () => {
     expect(t.saves.length).toBe(1)
     expect(t.prompts[0]).toContain('the conversation is about to be compacted (auto) (150000 tokens)')
     // A compaction handoff never blocks the session.
-    await $.tool.call({ tool: 'Read', input: {}, toolUseId: 'u1' })
+    await $.tool.call({ tool: 'Read', file_path: '/etc/hosts', tool_use_id: 'u1' })
     expect(t.ran).toEqual(['Read'])
   })
 

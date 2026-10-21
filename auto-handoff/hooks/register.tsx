@@ -14,20 +14,20 @@
 // the pickup happens in a new session and this one is not reopened by mistake.
 // (/clear keeps the same sidebar session, so the plain button leaves nothing
 // old behind; retiring is for picking up somewhere else.)
-// tool.call (main loop): once a threshold handoff is SAVED, the model's own
-// tool calls are refused with a reason telling it to stop and hand Matthew the
-// pickup line. Never while writing, never after a failed write, never in a
-// subagent, never for a plugin's own call, never for TaskStop. Each refusal
-// rereads the context first, so after a /clear or compaction it re-arms on
-// the spot instead of blocking the /prime that follows.
+// No tool-call block (removed 2026-10-21). A saved handoff never refuses the
+// model's tool calls: the block stalled /goal and other persistent sessions (a
+// goal turn with every tool denied makes no progress, and /clear removes the
+// goal). The 300k line is owned by Claude Code's own compaction instead,
+// `autoCompactWindow: 300000` in ~/.claude/settings.json; the handoff still
+// lands at the threshold and, via session.compact below, before the compaction
+// that follows. The band stays for a human who wants a fresh session.
 // session.compact (main loop, any window size): before a compaction drops
 // detail, write a handoff from the full transcript first, unless one already
 // covers this context window (saved since the last /clear or compaction) or
 // one is being written. It never blocks tool calls and never stops the
 // compaction: a failed write is reported and the compaction goes on.
 // (Adopted from Prompt Advisers' auto-handoff mod, 2026-10-08.)
-// /auto-handoff: status; "now" writes one immediately; "unblock" lifts the
-// block for the rest of this window.
+// /auto-handoff: status; "now" writes one immediately.
 
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
@@ -36,11 +36,6 @@ import type { HandoffRun } from '../types'
 
 const WINDOW = 1_000_000
 const THRESHOLD = 300_000
-// What the model may still call while blocked. TaskStop: a background agent
-// left running would keep spending, and the artifact-watchdog's stall wake
-// asks for exactly this call. Nothing else is needed to wrap up: the answer
-// that tells Matthew to clear is plain text, and the handoff is already saved.
-const WRAP_UP_TOOLS: ReadonlySet<string> = new Set(['TaskStop'])
 // The desktop app's session tools, reached with the engine's own connection.
 const SESSIONS = 'ccd_session_mgmt'
 
@@ -48,8 +43,6 @@ const isArmed = atom({ plugin: 'auto-handoff', key: 'isArmed' } as const, true)
 const crossings = atom({ plugin: 'auto-handoff', key: 'crossings' } as const, 0)
 const last = atom({ plugin: 'auto-handoff', key: 'last' } as const, null)
 const isDismissed = atom({ plugin: 'auto-handoff', key: 'isDismissed' } as const, false)
-const isBlocked = atom({ plugin: 'auto-handoff', key: 'isBlocked' } as const, false)
-const isLifted = atom({ plugin: 'auto-handoff', key: 'isLifted' } as const, false)
 const isRetiring = atom({ plugin: 'auto-handoff', key: 'isRetiring' } as const, false)
 const isCovered = atom({ plugin: 'auto-handoff', key: 'isCovered' } as const, false)
 
@@ -62,7 +55,7 @@ export const register: Register = on => {
     const result = await next(e)
     await $.command.register({
       name: 'auto-handoff',
-      description: 'Auto-handoff status; "now" writes a /next handoff immediately; "unblock" lifts the tool-call block',
+      description: 'Auto-handoff status; "now" writes a /next handoff immediately',
     })
     return result
   })
@@ -86,7 +79,7 @@ export const register: Register = on => {
       await update($, isArmed, () => false)
       // Outside this dispatch: the fork must not die with the turn's hook.
       $.clock.after(1, () => {
-        void writeHandoff($, tokens, true)
+        void writeHandoff($, tokens)
       })
     }
     return result
@@ -98,7 +91,7 @@ export const register: Register = on => {
     }
     const { context } = await $.session.usage()
     if (!isWriting && context.tokens !== undefined && !(await read($, isCovered))) {
-      await writeHandoff($, context.tokens, false, `the conversation is about to be compacted (${e.trigger})`)
+      await writeHandoff($, context.tokens, `the conversation is about to be compacted (${e.trigger})`)
     }
     const result = await next(e)
     if (!('skip' in result && result.skip)) {
@@ -116,28 +109,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('tool.call', async ($, e, next) => {
-    // A subagent's call, a plugin's own (the watchdog's Stop button), or a
-    // wrap-up tool: never the block's business.
-    if (e.agentId !== undefined || next.origin.plugin !== 'engine' || WRAP_UP_TOOLS.has(e.tool)) {
-      return next(e)
-    }
-    const reason = await blockReason($)
-
-    return reason === null ? next(e) : { deny: reason }
-  })
-
   on('command.run', { command: 'auto-handoff' }, async ($, e) => {
-    if (e.args.trim() === 'unblock') {
-      const wasBlocked = await read($, isBlocked)
-      await update($, isBlocked, () => false)
-      await update($, isLifted, () => true)
-      return {
-        text: wasBlocked
-          ? 'Tool calls unblocked for the rest of this context window. The block re-arms once the context drops below the threshold (a /clear or a compaction) and crosses it again.'
-          : 'Tool calls were not blocked. No block will be set for the rest of this context window.',
-      }
-    }
     if (e.args.trim() === 'now') {
       if (isWriting) {
         return { text: 'An auto-handoff is already being written.' }
@@ -151,7 +123,7 @@ export const register: Register = on => {
       }
       const { tokens } = context
       $.clock.after(1, () => {
-        void writeHandoff($, tokens, false)
+        void writeHandoff($, tokens)
       })
       return { text: 'Writing a handoff now. The band above the prompt shows when it is saved.' }
     }
@@ -167,20 +139,14 @@ export const register: Register = on => {
       (await read($, isCovered))
         ? 'Before a compaction: no new handoff, the last one covers this window.'
         : 'Before a compaction: writes a handoff first.',
-      (await read($, isBlocked))
-        ? 'Tool calls: BLOCKED (/auto-handoff unblock lifts it).'
-        : (await read($, isLifted))
-          ? 'Tool calls: unblocked for this window.'
-          : 'Tool calls: not blocked.',
+      'Tool calls: never blocked; the context compacts at the autoCompactWindow setting instead.',
     ]
     return { text: lines.join('\n') }
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const run = await read($, last)
-    const blocked = await read($, isBlocked)
-    // A block outlives Dismiss: the band is where Matthew learns why tools stopped.
-    if (e.props.hasSurvey || run === null || ((await read($, isDismissed)) && !blocked)) {
+    if (e.props.hasSurvey || run === null || (await read($, isDismissed))) {
       return next(e)
     }
     const { Box, Text, Button } = $.ui.resolve(e)
@@ -212,7 +178,7 @@ export const register: Register = on => {
             ✓ Handoff saved at {short(run.tokens)} tokens{' '}
           </Text>
           <Text dimColor>{run.path} </Text>
-          {!blocked && dismiss}
+          {dismiss}
         </Box>
         <Box flexDirection="row">
           {retiring ? (
@@ -235,13 +201,6 @@ export const register: Register = on => {
             />
           )}
         </Box>
-        {blocked && (
-          <Box flexDirection="row">
-            <Text color="yellow" bold>
-              ■ Claude's tool calls are blocked until you clear. /auto-handoff unblock continues here.
-            </Text>
-          </Box>
-        )}
       </Box>
     )
   })
@@ -335,51 +294,15 @@ async function setRun($: EngineInterface, value: HandoffRun): Promise<void> {
 }
 
 // Below the threshold again (a /clear, a compaction): the next crossing may
-// write and block again, and an unblock no longer carries.
+// write again.
 async function rearm($: EngineInterface): Promise<void> {
   await update($, isArmed, () => true)
-  await update($, isBlocked, () => false)
-  await update($, isLifted, () => false)
 }
 
-// Why a main-loop tool call is refused, or null to let it run. The block
-// stands only on a saved threshold handoff in a window still past the
-// threshold; the context is reread here because /clear raises no turn end
-// before /prime's first tool call. Any error lets the call run: a broken gate
-// must not wedge the session.
-async function blockReason($: EngineInterface): Promise<string | null> {
-  try {
-    if (!(await read($, isBlocked))) {
-      return null
-    }
-    const { context } = await $.session.usage()
-    const tokens = context.tokens ?? 0
-    if (context.window !== WINDOW || tokens < THRESHOLD) {
-      await rearm($)
-      return null
-    }
-    const run = await read($, last)
-    if (run === null || run.status !== 'saved') {
-      return null
-    }
-    return (
-      `[auto-handoff] Context is at ${short(tokens)} tokens; a handoff was saved to ${run.path}. ` +
-      'Make no more tool calls. Stop and tell Matthew to press "Clear and /prime ' +
-      `${run.project}" above the prompt (or run /clear, then /prime ${run.project}), ` +
-      'or to run /auto-handoff unblock to continue in this session.'
-    )
-  } catch {
-    return null
-  }
-}
-
-// isThreshold: started by crossing the threshold, so a save blocks tool
-// calls. "/auto-handoff now" and a compaction pass false: those never block.
 // why: the fork's first line, what prompted this handoff.
 async function writeHandoff(
   $: EngineInterface,
   tokens: number,
-  isThreshold: boolean,
   why = 'This session has reached its handoff point in a 1,000,000-token window',
 ): Promise<void> {
   if (isWriting) {
@@ -460,9 +383,6 @@ async function writeHandoff(
     }
     await setRun($, { status: 'saved', tokens, project, path: saved.out, detail: '' })
     await update($, isCovered, () => true)
-    if (isThreshold && !(await read($, isLifted))) {
-      await update($, isBlocked, () => true)
-    }
     $.ui.toast(`Handoff saved: ${saved.out}. Next: /clear, then /prime ${project}`, { timeoutMs: 15_000 })
   } catch (err) {
     await fail(String(err).slice(0, 160))
@@ -485,8 +405,6 @@ async function clearAndPrime($: EngineInterface, project: string): Promise<void>
     })
     return
   }
-  // The window is fresh: /prime must be free to read and verify.
-  await update($, isBlocked, () => false)
   try {
     await $.command.run({ command: 'prime', args: project })
   } catch (err) {
